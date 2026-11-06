@@ -200,3 +200,84 @@ fn omniroute_profiles_preserve_explicit_local_no_auth() {
     other.base_url = "https://remote.example/v1".into();
     assert!(other.save_provider_profile("Unsafe router").is_err());
 }
+
+#[test]
+fn opencode_presets_are_custom_remote_providers_with_their_own_keys() {
+    for (base_url, key_env) in [
+        (OPENCODE_ZEN_BASE_URL, OPENCODE_ZEN_KEY_ENV),
+        (OPENCODE_GO_BASE_URL, OPENCODE_GO_KEY_ENV),
+    ] {
+        let profile = opencode_profile(base_url, key_env);
+        assert_eq!(profile.provider, ProviderKind::Custom);
+        assert!(!profile.omniroute_no_auth);
+        assert_eq!(profile.base_url, base_url);
+        assert_eq!(profile.model, OPENCODE_MODEL);
+        assert_eq!(profile.api_key_env, key_env);
+        assert!(profile.subagent_model.is_empty());
+        assert!(profile.api_key_file.is_empty());
+        assert_eq!(
+            crate::connection_test::models_url(base_url)
+                .unwrap()
+                .as_str(),
+            format!("{base_url}/models")
+        );
+
+        let mut settings = Settings::default();
+        profile.apply_to(&mut settings);
+        settings.save_provider_profile("OpenCode").unwrap();
+        assert!(valid_key_env_name(&settings.api_key_env));
+
+        // Its own credential source only: a generic or other-provider key is
+        // never sent to OpenCode, and the key value never reaches config.toml.
+        let sources = KeySources {
+            env: |name| {
+                matches!(
+                    name,
+                    "FLINT_API_KEY" | "OPENAI_API_KEY" | "ANTHROPIC_API_KEY"
+                )
+                .then(|| "wrong-provider-fixture".into())
+            },
+            legacy_key_file: None,
+        };
+        assert_eq!(
+            settings.key_status(None, &sources),
+            KeyStatus::Missing(format!("${key_env}"))
+        );
+        let found = KeySources {
+            env: |name| {
+                matches!(name, OPENCODE_ZEN_KEY_ENV | OPENCODE_GO_KEY_ENV)
+                    .then(|| "opencode-fixture".into())
+            },
+            legacy_key_file: None,
+        };
+        assert_eq!(
+            settings.resolve_key(None, &found).unwrap().key,
+            "opencode-fixture"
+        );
+        assert!(
+            !toml::to_string(&settings)
+                .unwrap()
+                .contains("opencode-fixture")
+        );
+    }
+}
+
+#[test]
+fn opencode_preset_clears_router_no_auth_and_previous_key_files() {
+    let mut settings = Settings {
+        provider: ProviderKind::OmniRoute,
+        base_url: OMNIROUTE_BASE_URL.into(),
+        model: OMNIROUTE_MODEL.into(),
+        omniroute_no_auth: true,
+        api_key_file: "~/.config/flint/router.key".into(),
+        ..Settings::default()
+    };
+    opencode_profile(OPENCODE_ZEN_BASE_URL, OPENCODE_ZEN_KEY_ENV).apply_to(&mut settings);
+    assert_eq!(settings.provider, ProviderKind::Custom);
+    assert!(!settings.omniroute_no_auth);
+    assert!(settings.api_key_file.is_empty());
+    assert_eq!(
+        settings.key_status(None, &KeySources::none()),
+        KeyStatus::Missing("$OPENCODE_API_KEY".into())
+    );
+}

@@ -108,6 +108,86 @@ fn started(call_id: &str, kind: ToolKind, summary: &str) -> AgentEvent {
 
 #[test]
 #[ignore = "manual release-mode performance probe"]
+fn tool_event_lookup_perf_probe() {
+    const DELTAS: usize = 20_000;
+
+    // Worst case: the streaming call is buried behind a long transcript.
+    let mut deep = SessionView::default();
+    for i in 0..2_000 {
+        deep.fold(
+            started(&format!("history{i}"), ToolKind::Command, "ls"),
+            secs(0),
+        );
+    }
+    deep.fold(started("target", ToolKind::Command, "make"), secs(1));
+    for i in 0..1_500 {
+        deep.fold(
+            started(&format!("tail{i}"), ToolKind::Command, "ls"),
+            secs(1),
+        );
+    }
+    let start = std::time::Instant::now();
+    for line in 0..DELTAS {
+        std::hint::black_box(deep.fold(
+            AgentEvent::ToolOutputDelta {
+                call_id: "target".into(),
+                chunk: format!("out {line}\n"),
+            },
+            secs(2),
+        ));
+    }
+    eprintln!(
+        "tool_lookup_deep_{DELTAS}_runs_ms={:.3}",
+        start.elapsed().as_secs_f64() * 1000.
+    );
+
+    // Common case: the streaming call is the last row.
+    let mut single = SessionView::default();
+    single.fold(started("c0", ToolKind::Command, "make"), secs(1));
+    let start = std::time::Instant::now();
+    for line in 0..DELTAS {
+        std::hint::black_box(single.fold(
+            AgentEvent::ToolOutputDelta {
+                call_id: "c0".into(),
+                chunk: format!("out {line}\n"),
+            },
+            secs(2),
+        ));
+    }
+    eprintln!(
+        "tool_lookup_single_{DELTAS}_runs_ms={:.3}",
+        start.elapsed().as_secs_f64() * 1000.
+    );
+
+    // Parallel case: eight live calls interleave their output.
+    for parallel in [4usize, 8] {
+        let mut view = SessionView::default();
+        for p in 0..parallel {
+            view.fold(
+                started(&format!("p{p}"), ToolKind::Command, "make"),
+                secs(1),
+            );
+        }
+        let start = std::time::Instant::now();
+        for line in 0..DELTAS {
+            let p = line % parallel;
+            std::hint::black_box(view.fold(
+                AgentEvent::ToolOutputDelta {
+                    call_id: format!("p{p}"),
+                    chunk: format!("out {line}\n"),
+                },
+                secs(2),
+            ));
+        }
+        eprintln!(
+            "tool_lookup_parallel{parallel}_{DELTAS}_runs_ms={:.3}",
+            start.elapsed().as_secs_f64() * 1000.
+        );
+    }
+}
+
+#[test]
+#[ignore = "manual release-mode performance probe"]
 fn argument_count_perf_probe() {
     let value = json!({"content": "x".repeat(8 * 1024 * 1024)});
     let start = std::time::Instant::now();
@@ -637,6 +717,8 @@ fn approvals_and_nudges() {
                 kind: ToolKind::Command,
                 summary: "rm -rf build".into(),
                 decision: Some(ApprovalDecision::Deny),
+                // The user denied this one; only an ended turn sets `ended`.
+                ended: false,
             },
             Item::Nudge {
                 reason: NudgeReason::Verify,
@@ -1126,4 +1208,79 @@ fn chat_row_identity_is_deterministic_across_ordered_replay() {
     for ix in 0..first.items.len() {
         assert_eq!(first.row_identity(ix), replay.row_identity(ix));
     }
+}
+
+#[test]
+fn a_repeated_approval_request_for_one_call_keeps_one_card_and_one_count() {
+    let mut view = SessionView::default();
+    view.fold(AgentEvent::TurnStarted { turn_id: 1 }, secs(0));
+    for summary in ["cargo test", "cargo test (again)"] {
+        view.fold(
+            AgentEvent::ApprovalRequested {
+                call_id: "c1".into(),
+                kind: ToolKind::Command,
+                summary: summary.into(),
+            },
+            secs(1),
+        );
+    }
+    // ACP may re-ask for the same call; the user still answers once.
+    assert_eq!(
+        view.items
+            .iter()
+            .filter(|item| matches!(item, Item::Approval { .. }))
+            .count(),
+        1
+    );
+    assert_eq!(view.pending_approvals, 1);
+    view.resolve_approval("c1", ApprovalDecision::Approve);
+    assert_eq!(view.pending_approvals, 0);
+    // The sidebar reads the counter, the composer reads the cards: they must
+    // never disagree, or a session shows "needs you" with nothing to answer.
+    assert!(!view.has_pending_approval());
+    assert_eq!(
+        view.pending_approvals,
+        usize::from(view.has_pending_approval())
+    );
+}
+
+#[test]
+fn an_answered_call_id_does_not_block_a_later_request() {
+    let mut view = SessionView::default();
+    view.fold(AgentEvent::TurnStarted { turn_id: 1 }, secs(0));
+    view.fold(
+        AgentEvent::ApprovalRequested {
+            call_id: "call-1".into(),
+            kind: ToolKind::Command,
+            summary: "cargo test".into(),
+        },
+        secs(1),
+    );
+    view.resolve_approval("call-1", ApprovalDecision::Approve);
+    view.fold(
+        AgentEvent::TurnFinished {
+            turn_id: 1,
+            reason: TurnEndReason::Completed,
+        },
+        secs(2),
+    );
+    // Some agents reuse a call id in the next turn; that is a new question.
+    view.fold(AgentEvent::TurnStarted { turn_id: 2 }, secs(3));
+    view.fold(
+        AgentEvent::ApprovalRequested {
+            call_id: "call-1".into(),
+            kind: ToolKind::Command,
+            summary: "cargo clippy".into(),
+        },
+        secs(4),
+    );
+    assert_eq!(view.pending_approvals, 1);
+    assert!(view.has_pending_approval());
+    assert_eq!(
+        view.items
+            .iter()
+            .filter(|item| matches!(item, Item::Approval { .. }))
+            .count(),
+        2
+    );
 }

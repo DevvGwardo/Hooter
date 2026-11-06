@@ -39,6 +39,13 @@ pub enum Logged {
     Event(AgentEvent),
     /// User review of an external/legacy result, not a native engine claim.
     TaskReviewed(flint_agent::TaskReview),
+    /// The answer the user gave to an approval. Without it a restored
+    /// transcript replays the request as unanswered, and the turn's close
+    /// marks it denied.
+    Approval {
+        call_id: String,
+        decision: flint_agent::ApprovalDecision,
+    },
 }
 
 pub fn sessions_dir(home: &Path) -> PathBuf {

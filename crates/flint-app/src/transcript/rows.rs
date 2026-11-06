@@ -113,9 +113,10 @@ pub fn render(
             kind,
             summary,
             decision,
+            ended,
         } => {
             let _ = call_id;
-            super::approval::record(*kind, summary, *decision).into_any_element()
+            super::approval::record(*kind, summary, *decision, *ended).into_any_element()
         }
         Item::Error(message) if target.child.is_some() => {
             ui::label(message.clone(), size::SM, palette().danger).into_any_element()

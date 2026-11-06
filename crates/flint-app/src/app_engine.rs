@@ -1074,9 +1074,15 @@ impl FlintApp {
             decision,
             session.agent == flint_agent::AgentKind::Flint,
         );
+        // Persist the answer: a restore has no engine to answer the request,
+        // so an unrecorded answer comes back as an interrupted (denied) one.
+        let logged = session.log_approval(&call_id, decision);
         session.apply(change);
         if let Some(ops) = &session.ops {
             ops.try_send(Op::Approval { call_id, decision }).ok();
+        }
+        if let Err(err) = logged {
+            self.store_error = Some(format!("Couldn't save the approval decision: {err}"));
         }
         cx.notify();
     }

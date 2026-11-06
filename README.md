@@ -308,9 +308,21 @@ key file), not ambient `FLINT_API_KEY` or `OPENAI_API_KEY` fallbacks. Local serv
 that do not enforce authentication can use a key file containing a nonempty dummy
 key. OmniRoute retains its explicit, loopback-only no-auth option.
 
+**OpenCode** is available as two one-click presets: **OpenCode Zen**
+(pay-as-you-go, `https://opencode.ai/zen/v1`) and **OpenCode Go** (subscription,
+`https://opencode.ai/zen/go/v1`). Both speak the OpenAI-compatible Chat Completions
+API, stage as custom providers so they never borrow another provider's key, and
+default to `deepseek-v4.1-flash`. Get a key from `https://opencode.ai/auth`, then
+export `OPENCODE_API_KEY` (Zen) or `OPENCODE_GO_API_KEY` (Go) before launching, or
+point **API key file** at a file containing it. See
+[docs/opencode-provider.md](docs/opencode-provider.md). This is separate from
+**OpenCode as an agent** (ACP, above), which keeps its own OpenCode login.
+
 | Provider | Endpoint (`base_url`) | Recommended Model | Authentication |
 | :--- | :--- | :--- | :--- |
 | **OpenAI** | `https://api.openai.com/v1` | `gpt-4.1-mini`, `gpt-4.1` | `OPENAI_API_KEY` |
+| **OpenCode Zen** | `https://opencode.ai/zen/v1` | `deepseek-v4.1-flash`, `glm-5.3-flash`, `claude-sonnet-5` | `OPENCODE_API_KEY` |
+| **OpenCode Go** | `https://opencode.ai/zen/go/v1` | `deepseek-v4.1-flash`, `glm-5.3-flash`, `kimi-k2.7-code` | `OPENCODE_GO_API_KEY` |
 | **DeepSeek** | `https://api.deepseek.com/v1` | `deepseek-chat`, `deepseek-coder` | `DEEPSEEK_API_KEY` |
 | **OpenRouter** | `https://openrouter.ai/api/v1` | `anthropic/claude-sonnet-4.5` | `OPENROUTER_API_KEY` |
 | **Ollama (Local)** | `http://localhost:11434/v1` | `qwen2.5-coder:latest` | Any string (e.g. `FLINT_API_KEY=ollama`) |

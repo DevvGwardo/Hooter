@@ -18,6 +18,7 @@ fn approval_status_perf_probe() {
                 kind: ToolKind::Command,
                 summary: summary.clone(),
                 decision: None,
+                ended: false,
             })
             .collect();
         let start = std::time::Instant::now();
@@ -82,6 +83,7 @@ fn approval_sidebar_counts_only_unanswered_requests_in_original_order() {
             kind: ToolKind::Command,
             summary: summary.into(),
             decision,
+            ended: false,
         });
     }
     assert_eq!(
@@ -848,4 +850,136 @@ fn clock_reads_seconds_minutes_and_hours() {
     assert_eq!(super::clock(secs(42)), "42s");
     assert_eq!(super::clock(secs(185)), "3m 05s");
     assert_eq!(super::clock(secs(4_380)), "1h 13m");
+}
+
+/// Replays a saved log the way `FlintApp::restore_session` does.
+fn replay_records(records: Vec<crate::store::Logged>) -> crate::view_model::SessionView {
+    let mut view = crate::view_model::SessionView::default();
+    let mut clock = Duration::ZERO;
+    for record in records {
+        match record {
+            crate::store::Logged::User(text) => {
+                view.push_user(text);
+            }
+            crate::store::Logged::Event(event) => {
+                clock += Duration::from_millis(50);
+                view.fold(event, clock);
+            }
+            crate::store::Logged::TaskReviewed(review) => {
+                view.review_local_task(&review).ok();
+            }
+            crate::store::Logged::Approval { call_id, decision } => {
+                view.resolve_approval(&call_id, decision);
+            }
+        }
+    }
+    view
+}
+
+#[test]
+fn restored_session_shows_the_answer_given_to_an_approval() {
+    let root = tempfile::tempdir().unwrap();
+    let mut session = Session::new(1, root.path().into());
+    session.dir = Some(root.path().join("saved"));
+    let mut clock = Duration::ZERO;
+    let record = |session: &mut Session, event: AgentEvent, clock: &mut Duration| {
+        *clock += Duration::from_millis(50);
+        session.log_event(&event).unwrap();
+        session.view.fold(event, *clock);
+    };
+    record(
+        &mut session,
+        AgentEvent::TurnStarted { turn_id: 1 },
+        &mut clock,
+    );
+    record(
+        &mut session,
+        AgentEvent::ApprovalRequested {
+            call_id: "c1".into(),
+            kind: ToolKind::Command,
+            summary: "cargo test".into(),
+        },
+        &mut clock,
+    );
+    session
+        .view
+        .resolve_approval("c1", flint_agent::ApprovalDecision::Approve);
+    session
+        .log_approval("c1", flint_agent::ApprovalDecision::Approve)
+        .unwrap();
+    record(
+        &mut session,
+        AgentEvent::TurnFinished {
+            turn_id: 1,
+            reason: TurnEndReason::Completed,
+        },
+        &mut clock,
+    );
+    session.flush_records().unwrap();
+    assert_eq!(session.view.pending_approvals, 0);
+
+    let dir = session.dir.clone().unwrap();
+    let records: Vec<crate::store::Logged> = std::fs::read_to_string(dir.join("events.jsonl"))
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let restored = replay_records(records);
+    assert_eq!(
+        restored.pending_approvals, 0,
+        "a restored session has no engine to answer an approval, so it must \
+         not report one as still pending"
+    );
+    assert!(!restored.has_pending_approval());
+    assert!(matches!(
+        restored
+            .items
+            .iter()
+            .find(|item| matches!(item, super::Item::Approval { .. })),
+        Some(super::Item::Approval {
+            decision: Some(flint_agent::ApprovalDecision::Approve),
+            ..
+        })
+    ));
+}
+
+#[test]
+fn restored_session_replays_a_broad_approval_across_pending_requests() {
+    let root = tempfile::tempdir().unwrap();
+    let mut session = Session::new(1, root.path().into());
+    session.dir = Some(root.path().join("saved"));
+    for (call_id, summary) in [("c1", "cargo test"), ("c2", "cargo clippy")] {
+        let event = AgentEvent::ApprovalRequested {
+            call_id: call_id.into(),
+            kind: ToolKind::Command,
+            summary: summary.into(),
+        };
+        session.log_event(&event).unwrap();
+        session.view.fold(event, secs(1));
+        session
+            .log_approval(call_id, flint_agent::ApprovalDecision::ApproveAlways)
+            .unwrap();
+    }
+    // One broad answer releases the other waiting request too.
+    session
+        .view
+        .resolve_approval("c1", flint_agent::ApprovalDecision::ApproveAlways);
+    session.flush_records().unwrap();
+    assert_eq!(session.view.pending_approvals, 0);
+
+    let dir = session.dir.clone().unwrap();
+    let records: Vec<crate::store::Logged> = std::fs::read_to_string(dir.join("events.jsonl"))
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let restored = replay_records(records);
+    assert_eq!(restored.pending_approvals, 0);
+    assert!(!restored.has_pending_approval());
+    assert!(
+        restored
+            .items
+            .iter()
+            .all(|item| !matches!(item, super::Item::Approval { decision: None, .. }))
+    );
 }

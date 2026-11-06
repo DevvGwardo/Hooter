@@ -105,3 +105,88 @@ fn exit_marker_matches_the_previous_rule_without_full_line_normalization() {
     let oversized = "界🙂".repeat(1024 * 1024);
     assert!(!is_exit_code_line(&oversized));
 }
+
+#[test]
+fn an_unanswered_request_does_not_read_as_a_denial_the_user_made() {
+    use crate::transcript::approval::label;
+    use flint_agent::ApprovalDecision;
+
+    let (_, waiting) = label(ToolKind::Command, None, false);
+    assert!(waiting.contains("waiting for you below"), "{waiting:?}");
+
+    // The turn ended first: stored as a denial so it cannot be acted on.
+    let (icon, ended) = label(ToolKind::Command, Some(ApprovalDecision::Deny), true);
+    assert_eq!(ended, "Not answered — the turn ended");
+    assert_eq!(icon, gpui_kit::assets::IconName::ShieldAlert);
+
+    // The user's own denial keeps its wording.
+    let (icon, denied) = label(ToolKind::Command, Some(ApprovalDecision::Deny), false);
+    assert_eq!(denied, "Denied");
+    assert_eq!(icon, gpui_kit::assets::IconName::ShieldX);
+
+    for decision in [ApprovalDecision::Approve, ApprovalDecision::ApproveAlways] {
+        let (_, text) = label(ToolKind::Command, Some(decision), false);
+        assert!(text.starts_with("Approved"), "{text:?}");
+    }
+}
+
+#[test]
+fn the_turn_sweep_marks_an_unanswered_request_as_ended() {
+    use crate::view_model::SessionView;
+    use flint_agent::{AgentEvent, ApprovalDecision, TurnEndReason};
+    use std::time::Duration;
+
+    let mut view = SessionView::default();
+    view.fold(AgentEvent::TurnStarted { turn_id: 1 }, Duration::ZERO);
+    view.fold(
+        AgentEvent::ApprovalRequested {
+            call_id: "c1".into(),
+            kind: ToolKind::Command,
+            summary: "cargo test".into(),
+        },
+        Duration::from_secs(1),
+    );
+    view.fold(
+        AgentEvent::TurnFinished {
+            turn_id: 1,
+            reason: TurnEndReason::Interrupted,
+        },
+        Duration::from_secs(2),
+    );
+    assert!(matches!(
+        view.items.first(),
+        Some(crate::view_model::Item::Approval {
+            decision: Some(ApprovalDecision::Deny),
+            ended: true,
+            ..
+        })
+    ));
+
+    // A denial the user gave is not marked ended.
+    let mut answered = SessionView::default();
+    answered.fold(AgentEvent::TurnStarted { turn_id: 1 }, Duration::ZERO);
+    answered.fold(
+        AgentEvent::ApprovalRequested {
+            call_id: "c2".into(),
+            kind: ToolKind::Command,
+            summary: "cargo test".into(),
+        },
+        Duration::from_secs(1),
+    );
+    answered.resolve_approval("c2", ApprovalDecision::Deny);
+    answered.fold(
+        AgentEvent::TurnFinished {
+            turn_id: 1,
+            reason: TurnEndReason::Completed,
+        },
+        Duration::from_secs(2),
+    );
+    assert!(matches!(
+        answered.items.first(),
+        Some(crate::view_model::Item::Approval {
+            decision: Some(ApprovalDecision::Deny),
+            ended: false,
+            ..
+        })
+    ));
+}

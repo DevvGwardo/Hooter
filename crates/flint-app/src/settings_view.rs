@@ -762,6 +762,56 @@ pub fn render(
                             }
                             cx.notify();
                         })),
+                )
+                .child(
+                    Button::new("preset-opencode-zen")
+                        .label("OpenCode Zen")
+                        .selected(
+                            form.provider == settings::ProviderKind::Custom
+                                && form.base_url.read(cx).value().trim()
+                                    == settings::OPENCODE_ZEN_BASE_URL,
+                        )
+                        .on_click(cx.listener(|app, _, window, cx| {
+                            if let Some(form) = &mut app.settings_form {
+                                form.use_provider(
+                                    &settings::opencode_profile(
+                                        settings::OPENCODE_ZEN_BASE_URL,
+                                        settings::OPENCODE_ZEN_KEY_ENV,
+                                    ),
+                                    window,
+                                    cx,
+                                );
+                                form.provider_name.update(cx, |input, cx| {
+                                    input.set_value("", window, cx);
+                                });
+                            }
+                            cx.notify();
+                        })),
+                )
+                .child(
+                    Button::new("preset-opencode-go")
+                        .label("OpenCode Go")
+                        .selected(
+                            form.provider == settings::ProviderKind::Custom
+                                && form.base_url.read(cx).value().trim()
+                                    == settings::OPENCODE_GO_BASE_URL,
+                        )
+                        .on_click(cx.listener(|app, _, window, cx| {
+                            if let Some(form) = &mut app.settings_form {
+                                form.use_provider(
+                                    &settings::opencode_profile(
+                                        settings::OPENCODE_GO_BASE_URL,
+                                        settings::OPENCODE_GO_KEY_ENV,
+                                    ),
+                                    window,
+                                    cx,
+                                );
+                                form.provider_name.update(cx, |input, cx| {
+                                    input.set_value("", window, cx);
+                                });
+                            }
+                            cx.notify();
+                        })),
                 ),
         ))
         .when(form.provider == settings::ProviderKind::OmniRoute, |content| {

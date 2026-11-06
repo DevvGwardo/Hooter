@@ -52,6 +52,8 @@ mod local_provider;
 mod menu_overflow_ui;
 #[path = "blueprint_ui/omniroute.rs"]
 mod omniroute_ui;
+#[path = "blueprint_ui/opencode.rs"]
+mod opencode_ui;
 #[path = "blueprint_ui/prompt_queue.rs"]
 mod prompt_queue_ui;
 #[path = "blueprint_ui/provider_profiles.rs"]
@@ -1567,6 +1569,26 @@ fn clipboard_image_limit_and_invalid_data_keep_the_draft(cx: &mut TestAppContext
             .contains("supported image")
     }));
     assert_eq!(ui.composer_text(cx), "draft");
+}
+
+#[gpui_kit::test]
+fn a_successful_image_attach_never_erases_a_storage_failure(cx: &mut TestAppContext) {
+    let ui = open(cx);
+    let image = temp_dir("image").join("screen.png");
+    std::fs::write(&image, b"\x89PNG\r\n\x1a\npixels").unwrap();
+    const CRITICAL: &str =
+        "Couldn't save session events: No space left on device. Fix storage before continuing.";
+    ui.app.update(cx, |app, cx| {
+        app.store_error = Some(CRITICAL.into());
+        app.add_image_attachment(image);
+        cx.notify();
+    });
+    assert_eq!(ui.read(cx, |app, _| app.image_attachments.len()), 1);
+    assert_eq!(
+        ui.read(cx, |app, _| app.store_error.clone()),
+        Some(CRITICAL.into()),
+        "a transient attach success must not hide a stopped-storage failure"
+    );
 }
 
 #[gpui_kit::test]

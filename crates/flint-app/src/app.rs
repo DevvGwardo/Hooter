@@ -362,7 +362,23 @@ impl FlintApp {
         };
         let key_path = options.key_path.clone();
         let key_sources = options.key_sources.clone().unwrap_or_default();
-        let settings = Settings::load(&home, &key_sources);
+        let (settings, settings_read) = Settings::load_with_report(&home, &key_sources);
+        let settings_error = match settings_read {
+            crate::settings::SettingsRead::Used => None,
+            crate::settings::SettingsRead::RejectedKept => Some(format!(
+                "Couldn't read config.toml, so the settings are at their defaults. \
+                 The previous file is kept as {}.",
+                Settings::UNREADABLE_NAME
+            )),
+            crate::settings::SettingsRead::RejectedLost => Some(
+                "Couldn't read config.toml, so the settings are at their defaults, and the previous file could not be kept."
+                    .to_string(),
+            ),
+            crate::settings::SettingsRead::Unreadable => Some(
+                "Couldn't read config.toml, so the settings are at their defaults. Check the file's permissions."
+                    .to_string(),
+            ),
+        };
         let permission_choice_open = settings.permission_choice_pending == Some(true)
             && !options.skip_permission_choice
             && !options.ephemeral();
@@ -441,7 +457,9 @@ impl FlintApp {
             archived_session: None,
             archives: Vec::new(),
             archive_confirm: None,
-            store_error: general_error,
+            // One notice: a broken working folder first, else a settings file
+            // that had to be discarded.
+            store_error: general_error.or(settings_error),
             changes_open: options.open_changes,
             file_preview: None,
             file_preview_revision: 0,

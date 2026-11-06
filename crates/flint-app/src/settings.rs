@@ -17,6 +17,16 @@ pub const OMNIROUTE_BASE_URL: &str = "http://127.0.0.1:20128/v1";
 pub const OMNIROUTE_MODEL: &str = "auto";
 pub const OMNIROUTE_KEY_ENV: &str = "OMNIROUTE_API_KEY";
 
+/// OpenCode Zen (pay-as-you-go) Chat Completions endpoint.
+pub const OPENCODE_ZEN_BASE_URL: &str = "https://opencode.ai/zen/v1";
+pub const OPENCODE_ZEN_KEY_ENV: &str = "OPENCODE_API_KEY";
+/// OpenCode Go (subscription) Chat Completions endpoint. Same API surface,
+/// different billing and model catalogue.
+pub const OPENCODE_GO_BASE_URL: &str = "https://opencode.ai/zen/go/v1";
+pub const OPENCODE_GO_KEY_ENV: &str = "OPENCODE_GO_API_KEY";
+/// Tool-calling model listed by both OpenCode endpoints.
+pub const OPENCODE_MODEL: &str = "deepseek-v4.1-flash";
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProviderKind {
@@ -66,6 +76,20 @@ impl ProviderProfile {
         settings.subagent_model = self.subagent_model.clone();
         settings.api_key_env = self.api_key_env.clone();
         settings.api_key_file = self.api_key_file.clone();
+    }
+}
+
+/// OpenCode Zen/Go preset: a remote OpenAI-compatible endpoint that must keep
+/// its own credential source, so it stages as a custom provider.
+pub fn opencode_profile(base_url: &str, key_env: &str) -> ProviderProfile {
+    ProviderProfile {
+        provider: ProviderKind::Custom,
+        omniroute_no_auth: false,
+        base_url: base_url.to_string(),
+        model: OPENCODE_MODEL.to_string(),
+        subagent_model: String::new(),
+        api_key_env: key_env.to_string(),
+        api_key_file: String::new(),
     }
 }
 
@@ -164,6 +188,20 @@ pub struct Settings {
     pub mcp_servers: std::collections::BTreeMap<String, McpServer>,
 }
 
+/// What happened to the saved settings file on load.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SettingsRead {
+    /// Parsed, or absent.
+    Used,
+    /// Existed but did not parse; its text was kept under
+    /// [`Settings::UNREADABLE_NAME`].
+    RejectedKept,
+    /// Existed but did not parse and could not be copied anywhere.
+    RejectedLost,
+    /// Existed but could not be read at all.
+    Unreadable,
+}
+
 /// One `[mcp_servers.<name>]` entry.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
@@ -238,20 +276,48 @@ impl Settings {
         home.join("config.toml")
     }
 
+    /// Where a settings file that failed to parse is kept for recovery.
+    pub const UNREADABLE_NAME: &'static str = "config.toml.invalid";
+
     /// Reads the settings file; a missing or unreadable file gives defaults.
+    /// A file that exists but does not parse is copied to
+    /// [`Self::UNREADABLE_NAME`] first, because the next save replaces it.
     pub fn load(home: &Path, sources: &KeySources) -> Self {
+        Self::load_with_report(home, sources).0
+    }
+
+    /// [`Self::load`] plus why a saved file was discarded, so the caller can
+    /// say so instead of silently starting from defaults.
+    pub fn load_with_report(home: &Path, sources: &KeySources) -> (Self, SettingsRead) {
         match std::fs::read_to_string(Self::path(home)) {
-            Ok(text) => toml::from_str(&text).unwrap_or_default(),
+            Ok(text) => match toml::from_str(&text) {
+                Ok(settings) => (settings, SettingsRead::Used),
+                Err(_) => {
+                    // One wrong value drops every setting, so keep the text
+                    // the user can no longer recover from anywhere else.
+                    let kept =
+                        std::fs::copy(Self::path(home), home.join(Self::UNREADABLE_NAME)).is_ok();
+                    (
+                        Self::default(),
+                        if kept {
+                            SettingsRead::RejectedKept
+                        } else {
+                            SettingsRead::RejectedLost
+                        },
+                    )
+                }
+            },
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                Self::legacy_defaults(sources).unwrap_or_else(|| Self {
+                let settings = Self::legacy_defaults(sources).unwrap_or_else(|| Self {
                     permission_choice_pending: Some(
                         home.join("permission-choice-pending").is_file()
                             || (!home.join("sessions").exists() && !home.join("archive").exists()),
                     ),
                     ..Self::default()
-                })
+                });
+                (settings, SettingsRead::Used)
             }
-            Err(_) => Self::default(),
+            Err(_) => (Self::default(), SettingsRead::Unreadable),
         }
     }
 

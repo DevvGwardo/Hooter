@@ -217,6 +217,7 @@ impl SessionView {
                 kind,
                 summary,
                 decision: None,
+                ..
             } => Some((call_id.as_str(), *kind, summary.as_str())),
             _ => None,
         })

@@ -269,6 +269,7 @@ fn pending_approval_projection_preserves_oldest_order_and_ignores_counter_and_an
             kind,
             summary: summary.into(),
             decision,
+            ended: false,
         });
     }
     view.pending_approvals = 0;

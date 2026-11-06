@@ -13,6 +13,10 @@ use crate::session_options::MenuTarget;
 use crate::slash;
 use crate::slash::SlashCommand;
 
+/// Prefix of every message image attachment writes to `store_error`, so a
+/// success can clear its own notice without erasing someone else's failure.
+const IMAGE_NOTICE: &str = "Image: ";
+
 pub struct MentionMenu {
     pub query: String,
     pub results: Vec<String>,
@@ -202,11 +206,22 @@ impl FlintApp {
         if self.image_attachments.len() + self.pending_image_pastes
             >= crate::image_attach::MAX_IMAGES
         {
-            self.store_error = Some("Attach up to four images per message.".into());
+            self.store_error = Some(format!(
+                "{IMAGE_NOTICE}attach up to four images per message."
+            ));
         } else if let Err(error) = crate::image_attach::load(&path) {
-            self.store_error = Some(error);
+            self.store_error = Some(format!("{IMAGE_NOTICE}{error}"));
         } else {
-            self.store_error = None;
+            // Only this function's own notice is cleared. Another writer's
+            // message (a stopped session writer, a failed settings save) must
+            // survive an unrelated success.
+            if self
+                .store_error
+                .as_deref()
+                .is_some_and(|error| error.starts_with(IMAGE_NOTICE))
+            {
+                self.store_error = None;
+            }
             self.image_attachments.push(path);
         }
     }
@@ -231,7 +246,9 @@ impl FlintApp {
                     if self.image_attachments.len() + self.pending_image_pastes
                         >= crate::image_attach::MAX_IMAGES
                     {
-                        self.store_error = Some("Attach up to four images per message.".into());
+                        self.store_error = Some(format!(
+                            "{IMAGE_NOTICE}attach up to four images per message."
+                        ));
                         continue;
                     }
                     self.pending_image_pastes += 1;

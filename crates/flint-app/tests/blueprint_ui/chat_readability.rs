@@ -540,3 +540,29 @@ fn chat_code_actual_320_420_tiled_panes_keep_headers_scroll_and_composer_in_boun
         assert!(sessions.iter().all(|(_, engine)| engine.sent().is_empty()));
     }
 }
+
+#[gpui_kit::test]
+fn chat_code_actions_exist_for_a_fence_nested_in_a_list_item(cx: &mut TestAppContext) {
+    let ui = open(cx);
+    let engine = running_turn(&ui, cx);
+    let code = "npm install 界🙂";
+    let text = format!("Steps:\n\n1. Install the dependencies:\n\n   ```bash\n   {code}\n   ```\n");
+    // Receipts are keyed by the block's own span offset, not by block index.
+    let offset = text.find("```bash").unwrap();
+    engine.send(cx, AgentEvent::TextDelta(text));
+    let owner = owner(&ui, cx);
+    let (_, key, _) = row(&ui, cx, &owner);
+    let receipt = ui.read(cx, |app, _| {
+        app.chat_content.borrow().code_action(&key, offset)
+    });
+    assert!(
+        receipt.is_some(),
+        "a fenced block inside a list item must still offer copy and pin"
+    );
+    ui.click(cx, action(&key, "copy", offset));
+    assert_eq!(
+        cx.read_from_clipboard().and_then(|item| item.text()),
+        Some(code.into())
+    );
+    assert!(engine.sent().is_empty());
+}

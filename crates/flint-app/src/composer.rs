@@ -672,6 +672,9 @@ pub fn render(app: &FlintApp, window: &Window, cx: &mut Context<FlintApp>) -> An
             running && pinned.is_none() && !app.session().agent_starting(),
             |col| col.child(status_line(app)),
         )
+        // Storage failures stop work (and settings refuse to save) with no
+        // other surface, so name them here until something clears them.
+        .children(app.store_error.as_deref().map(store_notice))
         .children(pinned)
         .when(!compact && queued && !app.queue_popover, |col| {
             col.children(crate::queue_view::render(
@@ -739,6 +742,26 @@ fn starting_line(app: &FlintApp) -> impl IntoElement {
             size::SM,
             p.text_subtle,
         ))
+        .test_support()
+}
+
+/// One bounded line naming an app-level storage failure.
+fn store_notice(error: &str) -> impl IntoElement {
+    let p = palette();
+    div()
+        .id("store-error")
+        .mx(px(10.))
+        .px(px(6.))
+        .min_w_0()
+        .flex()
+        .items_center()
+        .gap(px(6.))
+        .child(ui::icon(IconName::CircleAlert, 13., p.danger))
+        .child(
+            ui::label(error.to_string(), size::XS, p.danger)
+                .min_w_0()
+                .truncate(),
+        )
         .test_support()
 }
 

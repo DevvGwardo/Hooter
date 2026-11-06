@@ -366,3 +366,73 @@ fn composer_query_reads_keep_large_unicode_drafts_mentions_and_slash_selection(
         assert_eq!(cx.opened_url(), None);
     }
 }
+
+#[gpui_kit::test]
+fn composer_shows_storage_failures_that_have_no_other_surface(cx: &mut TestAppContext) {
+    for dimensions in [(1440., 900.), (900., 560.)] {
+        let options = Options {
+            window_size: Some(dimensions),
+            ..test_options()
+        };
+        let home = options.home.clone().unwrap();
+        flint_app::settings::Settings::default()
+            .save(&home)
+            .unwrap();
+        let ui = open_with(cx, options);
+        assert!(!has(&ui, cx, "store-error"));
+
+        // A real failure: `save` cannot create its temporary beside the config.
+        let blocked = home.join("config.toml.tmp");
+        std::fs::create_dir(&blocked).unwrap();
+        ui.click(cx, "jev-toggle");
+        assert!(ui.read(cx, |app, _| app.store_error.is_some()));
+        assert!(
+            has(&ui, cx, "store-error"),
+            "a settings write failure must be visible"
+        );
+        ui.with(cx, |window, cx| {
+            window.render_frame(cx);
+            let notice = window.find("store-error").bounds();
+            let body = window.find("composer-body").bounds();
+            assert!(
+                notice.bottom() <= body.top(),
+                "the notice sits above the composer instead of over it"
+            );
+            assert!(body.top() < gpui_kit::px(dimensions.1));
+        });
+
+        std::fs::remove_dir(blocked).unwrap();
+        ui.app.update(cx, |app, cx| {
+            app.store_error = None;
+            cx.notify();
+        });
+        assert!(!has(&ui, cx, "store-error"));
+    }
+}
+
+#[gpui_kit::test]
+fn startup_names_a_settings_file_it_had_to_discard(cx: &mut TestAppContext) {
+    let options = test_options();
+    let home = options.home.clone().unwrap();
+    let broken = "model = \"hand-picked\"\napproval = 3\n";
+    std::fs::write(flint_app::settings::Settings::path(&home), broken).unwrap();
+
+    let ui = open_with(cx, options);
+    assert!(
+        home.join(flint_app::settings::Settings::UNREADABLE_NAME)
+            .exists(),
+        "the previous file is kept"
+    );
+    assert!(
+        has(&ui, cx, "store-error"),
+        "a discarded settings file must be reported, not silently replaced"
+    );
+    assert_eq!(
+        ui.read(cx, |app, _| app.settings.model.clone()),
+        flint_app::settings::Settings::default().model
+    );
+
+    // A clean home says nothing.
+    let clean = open_with(cx, test_options());
+    assert!(!has(&clean, cx, "store-error"));
+}

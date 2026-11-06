@@ -552,6 +552,19 @@ impl Session {
         self.log(Logged::Event(event.clone()))
     }
 
+    /// Records the user's answer to an approval so a restore replays what was
+    /// decided instead of an unanswered request. No-op for unsaved sessions.
+    pub(crate) fn log_approval(
+        &mut self,
+        call_id: &str,
+        decision: flint_agent::ApprovalDecision,
+    ) -> std::io::Result<()> {
+        self.log(Logged::Approval {
+            call_id: call_id.to_string(),
+            decision,
+        })
+    }
+
     /// Queues an owned record, with the same persistence and flush behavior.
     pub fn log(&mut self, record: Logged) -> std::io::Result<()> {
         if let Some(dir) = &self.dir {

@@ -569,3 +569,59 @@ fn sandbox_and_mcp_servers_load_from_the_config_file() {
     settings.save(dir.path()).expect("save");
     assert_eq!(Settings::load(dir.path(), &KeySources::none()), settings);
 }
+
+#[test]
+fn unreadable_config_is_kept_before_defaults_replace_it() {
+    let dir = tempfile::tempdir().unwrap();
+    // One wrong value type fails the whole file, so every setting below it is
+    // dropped. The first save then writes defaults over the only copy.
+    let broken = "model = \"hand-picked\"\n\
+                  base_url = \"https://internal.example/v1\"\n\
+                  approval = 3\n\
+                  [mcp_servers.repo]\ncommand = \"repo-mcp\"\n";
+    std::fs::write(Settings::path(dir.path()), broken).unwrap();
+
+    let loaded = Settings::load(dir.path(), &KeySources::none());
+    assert_eq!(loaded, Settings::default());
+    loaded.save(dir.path()).unwrap();
+
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("config.toml.invalid")).unwrap(),
+        broken,
+        "the unreadable settings must survive the first save"
+    );
+}
+
+#[test]
+fn readable_or_missing_config_creates_no_unreadable_copy() {
+    let dir = tempfile::tempdir().unwrap();
+    // Missing file: defaults, nothing to keep.
+    Settings::load(dir.path(), &KeySources::none());
+    assert!(!dir.path().join(Settings::UNREADABLE_NAME).exists());
+
+    // Partially written but valid TOML still parses, so it is not a failure.
+    std::fs::write(Settings::path(dir.path()), "model = \"kept-model\"\n").unwrap();
+    let loaded = Settings::load(dir.path(), &KeySources::none());
+    assert_eq!(loaded.model, "kept-model");
+    assert!(!dir.path().join(Settings::UNREADABLE_NAME).exists());
+}
+
+#[test]
+fn load_reports_a_discarded_settings_file_and_used_otherwise() {
+    let dir = tempfile::tempdir().unwrap();
+    assert_eq!(
+        Settings::load_with_report(dir.path(), &KeySources::none()).1,
+        super::SettingsRead::Used,
+        "a missing file is not a rejection"
+    );
+    std::fs::write(Settings::path(dir.path()), "approval = 3\n").unwrap();
+    let (loaded, read) = Settings::load_with_report(dir.path(), &KeySources::none());
+    assert_eq!(read, super::SettingsRead::RejectedKept);
+    assert_eq!(loaded, Settings::default());
+    assert!(dir.path().join(Settings::UNREADABLE_NAME).exists());
+    assert_eq!(
+        Settings::load(dir.path(), &KeySources::none()),
+        Settings::default(),
+        "the plain loader keeps its old contract"
+    );
+}

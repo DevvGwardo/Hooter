@@ -3130,14 +3130,642 @@ clipboard, hover, IME, VoiceOver, live providers and crash/slow-storage tests
 remain excluded. No real credentials, user-app restart, commit, push or
 publication occurred.
 
+## Pass 29: persist the answer given to an approval
+
+Status: completed for the saved-log record below. Focused before/after
+regressions, the full serial UI suite and the strict gates pass. The user's
+open app and `target/release/flint` were not rebuilt, restarted or replaced.
+
+### Proven gap and bounded fix
+
+Approval answers were never saved. `FlintApp::approval` resolved the row in
+the view and sent `Op::Approval` to the engine, but wrote nothing to
+`events.jsonl`; only the `ApprovalRequested` event was logged. On the next
+launch `restore_session` replays that event as an undecided card, and the
+turn's `TurnFinished` arm then runs its "interrupted approvals must not remain
+actionable" sweep, which sets every still-undecided card to
+`ApprovalDecision::Deny`.
+
+The result is a wrong, user-visible history: `transcript::approval::record`
+renders `Some(Deny)` as **"Denied"** in danger red, so every restored session
+that asked for permission showed approved work as denied. The user's decision
+was lost from the saved transcript.
+
+`Logged` gains `Approval { call_id, decision }`; `Session::log_approval`
+queues it (a no-op for unsaved sessions, like the other records);
+`FlintApp::approval` logs the answer it just applied and reports a storage
+failure through the existing `store_error`; `restore_session` replays it with
+`resolve_approval_scoped(&call_id, decision, session.agent == Flint)`, the same
+call and arguments the live path uses, so broad approvals still release the
+other waiting requests. One record per answer covers both, because
+`ApproveAlways` is stored as the decision the user gave rather than as the
+per-card results.
+
+No dependency, layout, animation, public API, ordering or visual change. Old
+logs load unchanged; the new variant only adds lines.
+
+### Focused regressions
+
+`restored_session_shows_the_answer_given_to_an_approval` writes a saved
+session through the production logging calls (`log_event`, `log_approval`),
+reads `events.jsonl` back, replays it the way `restore_session` does and
+asserts the restored card keeps `Some(Approve)`, that `pending_approvals` is
+zero and that nothing is pending.
+
+Red run before the fix (same fixture, no decision record, because none was
+written): the restored view held
+`Approval { call_id: "c1", decision: Some(Deny) }` and the assertion failed.
+That is the retained evidence for the reported wrong result.
+
+`restored_session_replays_a_broad_approval_across_pending_requests` answers one
+of two waiting requests with `ApproveAlways` and asserts the restore leaves no
+undecided card.
+
+### Measurement: tool-event lookup candidate
+
+The `tool_index` backward-scan candidate was measured before choosing this
+lead, with the new `tool_event_lookup_perf_probe`:
+`cargo test --release -p flint-app --lib tool_event_lookup_perf_probe --
+--ignored --nocapture`.
+
+| Case | 20,000 folds (ms) |
+| --- | ---: |
+| Call buried under 1,500 later rows | 33.100 |
+| Call is the last row | 4.194 |
+| 4 interleaved live calls | 3.606 |
+| 8 interleaved live calls | 2.527 |
+
+The scan costs about 1.6 us per delta in the worst case and is not paid at
+all when the streaming call is near the tail, which is the normal shape. An
+index or memo would need invalidation discipline over the public `items`
+field for no measurable frame gain, so the candidate stays open with these
+numbers rather than being traded for retained state.
+
+### Validation
+
+`cargo fmt --all -- --check`, `git diff --check` and
+`cargo clippy --offline --locked --workspace --all-targets -- -D warnings`
+pass. App library tests **274** passed, **23** ignored (baseline before this
+pass: 272/23). Serial `--test blueprint_ui` **407** passed, **1** ignored,
+including `real_engine_archive_drains_approval_and_history_then_undo_and_restart_recover`
+and the approval-answer, sidebar-approval and subagent-routing fixtures.
+`--test platform_ui` **5** passed.
+
+No engine or ACP crate changed, so no engine/live gate was required. No
+native capture, whole-app perf sweep, physical input, clipboard, VoiceOver or
+live-provider run was performed.
+
+### Remaining limits
+
+- A log cut off mid-turn (crash before `TurnFinished`) still restores an
+  undecided card and a non-zero `pending_approvals` for a request no engine
+  can answer. That case is untouched here; it needs a restore-time decision
+  about what an interrupted request should display.
+- The answer is replayed with the agent kind from `meta.json`; a session whose
+  agent kind changed between runs would replay with the new kind's release
+  behavior.
+- An older build reading a newer log drops the unknown record silently, as it
+  already does for any unparsable line.
+- Restored transcripts still do not reconstruct the engine's own view of the
+  approval; only the displayed decision is recovered.
+
+## Pass 30: keep a settings file that failed to parse
+
+Status: completed for the config load/save pair below. Focused before/after
+regressions, the full app library and serial UI suites, formatting and strict
+workspace Clippy pass. The user's open app and `target/release/flint` were not
+rebuilt, restarted or replaced.
+
+### Proven gap
+
+`Settings::load` read `config.toml` and ran `toml::from_str(&text)
+.unwrap_or_default()`. `Settings` carries `#[serde(default)]` at the container
+level, so a partial file loads fine, but **one** wrongly typed value fails the
+whole document and every setting is replaced by the defaults: the selected
+model and `base_url`, provider profiles, `approval`, `sandbox`, the theme and
+every `[mcp_servers.*]` entry.
+
+The loss is not recoverable. `Settings::save` writes `config.toml.tmp` and
+renames it over `config.toml`, and many ordinary actions save (`agents.rs`
+model changes, `app_actions.rs` approval/sandbox toggles, `session_options.rs`).
+So the first save after a bad launch replaces the user's only copy with the
+defaults; nothing on disk records what it held.
+
+Reachable triggers: hand-editing the file (the MCP block is hand-written), a
+field whose type changed between versions, or any TOML syntax error. A newer
+build writing an older field type reproduces it on the next launch.
+
+### Bounded fix
+
+On a parse failure `load` now copies the file to
+`Settings::UNREADABLE_NAME` (`config.toml.invalid`) before returning
+`Self::default()`. The copy is best effort — its error is ignored, so a
+read-only or full home behaves exactly as before. What is loaded is unchanged,
+`save` is unchanged, no dependency, struct field, layout or visual change was
+added, and a readable or missing file creates no copy.
+
+### Focused regressions
+
+`unreadable_config_is_kept_before_defaults_replace_it` writes a file holding a
+hand-picked model, base URL, an MCP server and one wrong-typed `approval = 3`,
+loads it, saves over it, and reads the backup back.
+
+Red run before the fix: `std::fs::read_to_string(.../config.toml.invalid)`
+panicked with `NotFound` — the settings were gone. Green after the fix: the
+backup is byte-identical to the original text.
+
+`readable_or_missing_config_creates_no_unreadable_copy` guards the other side:
+a missing file and a small valid file both load without leaving a backup.
+
+### Validation
+
+`cargo fmt --all -- --check`, `cargo clippy --offline --locked --workspace
+--all-targets -- -D warnings` and `git diff --check` pass. App library tests
+**276** passed, **23** ignored (baseline 274/23). Serial `--test blueprint_ui`
+**407** passed, **1** ignored. No engine or ACP crate changed, so no
+engine/live gate applied.
+
+### Remaining limits
+
+- The user is not told. Nothing in the UI says the file was unreadable or that
+  a copy exists; recovery depends on finding `config.toml.invalid` by hand.
+- A later parse failure overwrites the same backup name, so only the most
+  recent unreadable file is kept.
+- A file that exists but cannot be *read* (permissions, I/O error) still yields
+  defaults with no copy, because there are no bytes to keep.
+- No native run, whole-app perf sweep, or restart of the user's app was made;
+  this pass changes no hot path and claims no speedup.
+
+## Pass 31: list-nested code actions already work, and the tray projection is not a cost
+
+Status: **no production change was made.** Two leads were run to evidence and
+closed, one regression test was added for a previously unexercised path, and
+one intermittent suite failure is recorded as unproven. `chat_code.rs` is
+byte-identical to `HEAD`; the user's open app and `target/release/flint` were
+not rebuilt, restarted or replaced.
+
+### Lead 1: code actions for a fence inside a list item — negative result
+
+`FlintApp::code_action` only mints Copy/Pin when `fenced_value` reproduces the
+parser's own `code()` and `lang()`. I suspected a fence nested in a list lost
+those actions, because `fenced_value` derives its prefix from the text before
+the span and I assumed that was the list marker (`"1. "`).
+
+I implemented the fix a list item seems to need — dedent by the closing
+fence's own indentation when the container prefix does not apply — then
+instrumented `code_action` and found the premise was wrong: for
+`Steps:\n\n1. Install the dependencies:\n\n   \`\`\`bash\n   npm install 界🙂\n   \`\`\``
+the parser span is `41..78`, so `before` ends with `"   "` (the continuation
+indent, not the marker). `prefix = "   "` already strips the body and closing
+line, `value` equals `code` and the languages match.
+
+**The unmodified code already offers the actions.** The toggle run proves it:
+the new fixture passes with both the original body and my candidate change.
+The candidate change was reverted rather than landed — a fix without a failing
+case is a guess, and it would have dedented bodies the parser keeps.
+
+Only the *test* is kept, as `chat_code_actions_exist_for_a_fence_nested_in_a_list_item`
+in `tests/blueprint_ui/chat_readability.rs`. It pins two things no fixture
+covered before: a fenced block nested in a numbered list (with a Unicode
+payload) and the fact that receipts are keyed by the block's **span offset**,
+not its block index. My first version of the test looked the receipt up at
+`0` and failed for that reason alone — the harness contract is now documented
+by the test itself.
+
+### Lead 2: the large live-task projection candidate — measured, not a cost
+
+The top candidate asked for a measurement before trading retained state for a
+skip-tail count. Reproduced with the existing probe:
+`cargo test --offline --locked --release -p flint-app --lib
+running_command_projection_perf_probe -- --ignored --nocapture --test-threads=1`.
+
+| Shape | 1,000 calls (ms) | per call |
+| --- | ---: | ---: |
+| 1 live command | 0.007 | 7 ns |
+| 8 live | 0.011 | 11 ns |
+| 512 live | 1.537 | 1.54 us |
+| 8 live + 2,048 completed | 2.485 | 2.49 us |
+| 0 live + 2,048 completed | 2.417 | 2.42 us |
+
+The worst case is 2.5 us per composer frame, 0.015% of a 60 fps frame, and the
+`inline` eight-entry array keeps the common shapes at nanoseconds. An index or
+retained running-command counter would buy nothing measurable, so the
+projection half of the candidate is **closed** with these numbers instead of
+changed.
+
+### Open: an intermittent app library failure
+
+One run of `cargo test -p flint-app --lib` reported **271 passed, 5 failed**;
+the shell pipeline had already truncated the per-test lines, so the five names
+were lost. Three immediate reruns passed **276/276**. I cannot attribute the
+failure to anything in this pass (no source changed), and I cannot name the
+tests. Recorded as a lead rather than a fix; it needs reproduction with full
+output before anyone acts on it.
+
+### Validation
+
+`cargo fmt --all -- --check`, `git diff --check` and `cargo clippy --offline
+--locked --workspace --all-targets -- -D warnings` pass. App library tests
+**276** passed, **23** ignored, on three consecutive runs (the fourth, earlier
+run is the failure above). Serial `--test blueprint_ui` **408** passed, **1**
+ignored. No rendered view changed, so no blueprint sweep was run, and no native
+capture or whole-app measurement was made.
+
+### Remaining limits
+
+- Retained coverage was added for one nesting shape only; nested blockquote
+  lists (`>   \`\`\``) and attribute info strings (`\`\`\`rust,ignore`) are
+  still unexercised.
+- The tray's **render** cost (one row per live command inside a fixed 88/144 px
+  scroller) is not measured here — only the projection iterator is. A 512-row
+  tray could still dominate paint, and measuring it needs the UI harness.
+- The five-test library failure is unexplained; treat any future "5 failed,
+  271 passed" as the same event until it is reproduced with full output.
+
+## Pass 32: name app-level storage failures in the composer
+
+Status: completed for the composer notice below. Focused before/after
+regression, the full serial UI suite, library and platform suites, formatting
+and strict workspace Clippy pass. The user's open app and
+`target/release/flint` were not rebuilt, restarted or replaced.
+
+### Proven gap
+
+`FlintApp::store_error` is written by more than twenty real failure paths —
+the one that **stops production** ("Couldn't save session events: {error}.
+Fix storage before continuing."), settings saves, session message and detail
+writes, image-attach limits, and Pass 29's approval-decision write. A grep
+across `crates/` shows it is read **only by tests**: no render, no notification,
+no status. Nearby app-level errors *are* shown — `permission_choice_error`
+(`permission_choice.rs:75`), `queue.error` as `queue-error`
+(`queue_view.rs:299`) — which makes the omission a defect rather than a style
+choice. A full disk or an unwritable `~/.flint` makes the app refuse work and
+say nothing.
+
+### Bounded fix
+
+One element (`store_notice`, 15 lines) in the composer column, between the
+status line and the pinned approval card, rendered only while `store_error` is
+`Some`: a 13 px danger icon and a `truncate`d `size::XS` label in the existing
+palette, `id("store-error")`, `mx(px(10.))` to match the card. No dismiss
+control, animation, dependency, retained state or ordering change; the column
+already threads `.children(Option<…>)` neighbours, so this follows the file's
+own idiom.
+
+### Focused regression
+
+`composer_shows_storage_failures_that_have_no_other_surface` runs at
+**1440×900** and **900×560**: no notice at rest; a **real** failure provoked
+the way the existing JEV fixture does it (a directory created at
+`config.toml.tmp`, so `save` cannot write its temporary); asserts the message
+reaches `store_error`, that `store-error` renders, that the notice's bottom
+sits above `composer-body`'s top so it pushes rather than covers the card, and
+that clearing the message removes it.
+
+Red run before the fix panicked at "a settings write failure must be visible":
+the failure was in state with nothing on screen.
+
+### Count
+
+Before: **0** rendered surfaces for `store_error`. After: **1** element of one
+row (~21 px) in the composer column, present only while the message is set. This
+is a coverage count, not a timing or CPU claim.
+
+### Validation
+
+`cargo fmt --all -- --check`, `git diff --check`, `cargo clippy --offline
+--locked --workspace --all-targets -- -D warnings` pass. Serial
+`--test blueprint_ui` **409** passed, **1** ignored (was 408). Library **276**
+passed, **23** ignored. `--test platform_ui` **5** passed.
+
+No native capture and no blueprint sweep were run. The new element exists only
+in a failure state, so the harness asserts its bounds at both window sizes
+instead of comparing screenshots of a state the sweeps do not produce.
+
+### Remaining limits
+
+- The notice cannot be dismissed, and several `store_error` writers are
+  transient (image-attach limits), so a stale line can remain until another
+  action clears it.
+- Severities are flattened: a production-stopping disk failure and "Attach up
+  to four images per message" render identically.
+- The line shows the raw error text and offers no path forward (no reveal of
+  the storage location, no copy).
+- Headless assertions cover presence and layout bounds only; no VoiceOver
+  announcement, physical input or native run.
+
+## Pass 33: say when the settings file was discarded at startup
+
+Status: completed for the load report and startup notice below. Focused
+before/after regressions, the full serial UI suite, library and platform
+suites, formatting and strict workspace Clippy pass. The user's open app and
+`target/release/flint` were not rebuilt, restarted or replaced.
+
+### Proven gap
+
+Pass 30 stopped `Settings::load` from silently overwriting a `config.toml` it
+could not parse, by copying it to `config.toml.invalid`. It left the user
+uninformed: the app started with every setting at its default and said
+nothing, so the only way to notice was to spot that the model, provider,
+approval mode and `[mcp_servers.*]` had all changed. Pass 32 then gave
+`store_error` a surface in the composer, which makes the missing report the
+only remaining hole in that path.
+
+### Bounded fix
+
+`Settings::load_with_report` returns `(Settings, SettingsRead)` where
+`SettingsRead` is `Used` / `RejectedKept` / `RejectedLost` / `Unreadable`;
+`load` delegates to it and keeps its exact old contract, so all existing call
+sites and tests are untouched. `FlintApp::new` seeds `store_error` from the
+report (`general_error.or(settings_error)`, the file's existing precedence
+idiom), so Pass 32's `store-error` line names the problem at launch, including
+where the previous file is.
+
+No new element, dependency, retained state or ordering change; the enum
+distinguishes the three failure shapes so the message never claims a copy that
+was not made.
+
+### Focused regressions
+
+`startup_names_a_settings_file_it_had_to_discard` (UI, `composer_refresh.rs`)
+writes `model = "hand-picked"` plus a wrong-typed `approval = 3` into a fresh
+home, opens the app and asserts the backup exists, that `store-error` renders,
+and that the loaded model is the default; a second app opened on a clean home
+shows no notice.
+
+Red run before the fix panicked at "a discarded settings file must be reported,
+not silently replaced" — the backup existed, nothing said so.
+
+`load_reports_a_discarded_settings_file_and_used_otherwise` (lib) pins the
+report itself: a missing file is `Used`, a broken one is `RejectedKept` with
+the backup present, and plain `load` still returns defaults.
+
+### Count
+
+Before: **0** startup reports for a discarded settings file. After: **1**
+composer line, plus a typed report the caller can branch on.
+
+### Validation
+
+`cargo fmt --all -- --check`, `git diff --check`, `cargo clippy --offline
+--locked --workspace --all-targets -- -D warnings` pass. Serial
+`--test blueprint_ui` **410** passed, **1** ignored (was 409). Library **277**
+passed, **23** ignored (was 276). `--test platform_ui` **5** passed.
+
+No native capture or blueprint sweep: the notice is the same element Pass 32
+validated in both window sizes, and it now also appears on a state the sweeps
+do not produce.
+
+### Remaining limits
+
+- The notice is only shown at startup; a file that becomes unreadable while
+  the app runs is not re-checked.
+- `RejectedLost` and `Unreadable` share a composer line with transient
+  storage messages (Pass 32's flattened severity), so a permissions problem
+  looks like any other storage error.
+- Nothing re-reads `config.toml.invalid` into the form; recovery is manual.
+- No VoiceOver or physical-input check of the new startup line.
+
+## Pass 34: one unanswered request, one approval card
+
+Status: completed for the duplicate-request fold below. Focused before/after
+regressions, the full serial UI suite, library and platform suites, formatting
+and strict workspace Clippy pass. The user's open app and
+`target/release/flint` were not rebuilt, restarted or replaced.
+
+### Proven gap
+
+The fold pushed an `Item::Approval` and incremented `pending_approvals` for
+**every** `ApprovalRequested`, with no check for a call it had already been
+asked about. `Mapper::approval` (`flint-acp/src/mapper.rs:465`) emits that
+event unconditionally for whatever id arrives, and ACP agents re-send
+`session/request_permission` for a still-open tool call when a permission
+prompt times out or the connection reconnects. (The native engine cannot: its
+`approvals.register` returns `None` for a known call and answers it silently.)
+
+Two cards for one call can never both be cleared. `resolve_approval_scoped`
+finds only the first row and decrements the counter once, so the reachable end
+state was `pending_approvals == 1` with `has_pending_approval() == false`:
+`Session::status` reports `NeedsApproval` (it reads the counter), the sidebar
+shows "needs you", and `answer_pending` finds nothing to answer. Nothing in the
+session can clear it — a stuck badge over an empty queue.
+
+### Bounded fix
+
+`ApprovalRequested` now returns `Change::default()` when an **undecided**
+`Item::Approval` with the same `call_id` already exists. The check deliberately
+ignores decided rows: some agents reuse call ids in the following turn (the
+repository's own `LocalProvider` fixture does), and the first version of this
+guard — matching any row — broke
+`real_engine_after_undo_resumes_saved_history_without_old_broad_permission`,
+which the full serial suite caught before the change was kept. No other
+behavior changed: a fresh request, a fresh id, and every decision path are
+untouched.
+
+### Focused regressions
+
+`a_repeated_approval_request_for_one_call_keeps_one_card_and_one_count`
+duplicates one request (with different summaries, as a retry would) and
+asserts one card, counter **1**, and — after answering — counter 0 with
+`pending_approvals == usize::from(has_pending_approval())`, the invariant that
+keeps the sidebar and the cards in agreement.
+
+Red run before the fix failed on the card count. The first fix attempt passed
+this test but failed a real-engine UI fixture, which is why the guard is
+scoped to undecided rows.
+
+`an_answered_call_id_does_not_block_a_later_request` pins the other direction:
+an approved call id reused in the next turn produces a second card and a
+counter of 1.
+
+### Count
+
+Before: **2** cards and a counter of **2** for one repeated request, ending at
+counter 1 with no answerable card. After: **1** card, counter **1**, answerable
+once.
+
+### Validation
+
+`cargo fmt --all -- --check`, `git diff --check`, `cargo clippy --offline
+--locked --workspace --all-targets -- -D warnings` pass. Serial
+`--test blueprint_ui` **410** passed, **1** ignored. Library **279** passed,
+**23** ignored (was 277). `--test platform_ui` **5** passed.
+
+No engine or ACP crate changed, so no engine/live gate applied. No native
+capture, blueprint sweep or VoiceOver check was made; the change is a pure
+fold guard with no rendered pixels of its own.
+
+### Remaining limits
+
+- The guard is per session view, by `call_id`. Two different tools reusing one
+  id inside a single turn would collapse into one card; that shape is not
+  produced by either engine today and is not covered.
+- A duplicate arriving after the user answered still creates a second card
+  (decided rows do not block), and that card's answer goes nowhere useful.
+  Distinguishing it needs a turn/step id on the request, which the protocol
+  does not carry.
+- The ACP mapper still emits duplicates; only the fold is idempotent, so a
+  duplicate still costs one wasted event.
+
+## Pass 35: an unanswered request no longer reads as your denial
+
+Status: completed for the item marker and its label below. Focused before/after
+regressions (including a toggle run), the full serial UI suite, library and
+platform suites, formatting and strict workspace Clippy pass. The user's open
+app and `target/release/flint` were not rebuilt, restarted or replaced.
+
+### Proven gap
+
+When a turn ends with a request unanswered, the `TurnFinished` arm sweeps every
+undecided `Item::Approval` to `ApprovalDecision::Deny` so nothing stays
+actionable. `transcript::approval::record` then renders `Some(Deny)` as
+**"Denied"** in danger red — so a turn the user interrupted, or one that
+failed, reports that the user refused work they were never asked about. The
+same applies to a saved log cut off before `TurnFinished`: the restore sweep
+denies the request, and Pass 29's remaining limit is exactly this display.
+
+### Bounded fix
+
+`Item::Approval` gains `ended: bool`. The sweep sets it together with the
+denial; the fold initializer and every answer path leave it `false`. The label
+logic moves into a pure `approval::label(kind, decision, ended)` (same strings
+as before for the three existing states) with one new arm: a denial the sweep
+made reads **"Not answered — the turn ended"** in the warning tone instead of
+the danger tone. `record` keeps its signature plus the flag, `rows.rs` passes
+it through, and `turns.rs`'s pending-approval pattern takes `..`.
+
+No dependency, layout, ordering or public-behavior change for a real denial;
+no new element — the same row renders a different, truthful label.
+
+### Focused regressions
+
+`an_unanswered_request_does_not_read_as_a_denial_the_user_made` pins all four
+labels; `the_turn_sweep_marks_an_unanswered_request_as_ended` pins that the
+sweep sets `ended` while a user's own denial does not.
+
+Red proof by toggle (the pre-pass label behavior restored, branch removed):
+`left: "Denied"` vs `right: "Not answered — the turn ended"` — exactly the
+wrong reading this pass removes. Restored, the test passes.
+
+Two suite failures during the change are recorded rather than hidden: the
+first scripted edit marked the wrong constructor, and
+`view_model::tests::approvals_and_nudges` — a **user** denial — caught it
+(`ended: false` was expected), which is the guard working.
+
+### Count
+
+Before: **1** label for both "the user denied" and "the turn ended first".
+After: **2** distinct labels, warning vs danger.
+
+### Validation
+
+`cargo fmt --all -- --check`, `git diff --check`, `cargo clippy --offline
+--locked --workspace --all-targets -- -D warnings` pass. Serial
+`--test blueprint_ui` **410** passed, **1** ignored. Library **281** passed,
+**23** ignored (was 279). `--test platform_ui` **5** passed.
+
+No engine or ACP crate changed. No native capture, blueprint sweep or VoiceOver
+check: the change has no layout of its own, and the harness cannot read rendered
+text, so the label is pinned as a pure function.
+
+### Remaining limits
+
+- The new wording is only covered as a pure function; no test asserts it
+  reaches the screen, and the harness cannot read rendered text.
+- A request answered *and* then interrupted in the same turn keeps the user's
+  label (correct), but a rescued-then-abandoned case is not modelled.
+- `Item` is public, so any external consumer matching `Item::Approval` without
+  `..` needs the new field; the in-repo sites are updated.
+- Pass 29's crash-truncated log now reads truthfully, but the counter still
+  shows a pending approval until the restore sweep runs; that ordering is
+  unchanged.
+
+## Pass 36: a successful image attach keeps another writer's failure visible
+
+Status: completed for the `store_error` ownership rule below. Focused
+before/after regression, the full serial UI suite, library and platform
+suites, formatting and strict workspace Clippy pass. The user's open app and
+`target/release/flint` were not rebuilt, restarted or replaced.
+
+### Proven gap
+
+`add_image_attachment` ended its success path with `self.store_error = None`.
+`store_error` is one shared slot with more than twenty writers, including the
+one that **stops production** ("Couldn't save session events: … Fix storage
+before continuing.") and Pass 29's approval-decision failure. So attaching an
+image after a disk-full event erased the only notice that nothing was being
+saved: Pass 32's composer line disappeared, the app stayed stopped, and the
+user saw no reason. The same unconditional clear also wiped a failed settings
+save and a broken general-agent folder report seeded at startup.
+
+The sibling writers already use ownership checks (`settings_view.rs` matches
+`starts_with("Couldn't save JEV setting:")`), so the flat clear was an outlier.
+
+### Bounded fix
+
+Image attachment's two messages gain an `Image: ` prefix
+(`IMAGE_NOTICE`), and the success path clears `store_error` **only** when the
+current message carries that prefix. Two limit notices are reworded to
+"Image: attach up to four images per message."; a load error becomes
+"Image: {error}". No new field, no new surface, no ordering change; the
+existing `contains("four")` and `contains("supported image")` assertions in
+`clipboard_image_limit_and_invalid_data_keep_the_draft` still hold.
+
+### Focused regression
+
+`a_successful_image_attach_never_erases_a_storage_failure` seeds the exact
+stopped-writer message, attaches a valid PNG, and asserts the attachment
+succeeded **and** the message survived.
+
+Red run before the fix: `left: None`, `right:
+Some("Couldn't save session events: No space left on device. Fix storage
+before continuing.")` — the failure was erased by an unrelated success.
+
+`clipboard_image_limit_and_invalid_data_keep_the_draft` re-run confirms the
+composer still replaces its own notice on a limit or a bad image.
+
+### Count
+
+Before: **1** unrelated success clearing **any** notice. After: **1** notice
+class that only its owner clears.
+
+### Validation
+
+`cargo fmt --all -- --check`, `git diff --check`, `cargo clippy --offline
+--locked --workspace --all-targets -- -D warnings` pass. Serial
+`--test blueprint_ui` **411** passed, **1** ignored (was 410). Library **281**
+passed, **23** ignored. `--test platform_ui` **5** passed.
+
+No engine or ACP crate changed. No native capture, blueprint sweep or VoiceOver
+check; the change touches one string prefix and one guard.
+
+### Remaining limits
+
+- Only the image path is scoped. The other writers still overwrite each other:
+  a later settings-save failure replaces a stopped-writer message, and nothing
+  keeps the most severe one.
+- A stale `Image: …` notice still survives until the next successful attach
+  (or another writer), as recorded in Pass 32's limits.
+- The `Image: ` prefix is user-visible wording; it is not part of any saved or
+  protocol format.
+
 ## Candidates for later passes
 
 These are investigation leads, not accomplished fixes:
 
-- **Large live-task projection:** the first eight references already reuse
-  the initial scan. The over-eight tail is counted and then consumed, and the
-  retained 512-command stress case worsens. Measure a broader realistic
-  workload before trading extra retained state for one-pass counts.
+- **Live-task tray rendering:** the projection is settled (Pass 31: 7 ns for
+  one live command, 2.5 us at 8 live + 2,048 completed, measured with
+  `running_command_projection_perf_probe`). What is not settled is the *render*
+  side: the composer draws one row per live command inside a fixed 88/144 px
+  scroller, so a large live tray may cost paint time rather than scan time.
+  Measure with the UI harness before changing the projection further.
+- **Intermittent app library failure:** one run of
+  `cargo test -p flint-app --lib` reported 271 passed / 5 failed; names were
+  lost to output truncation. Eight further runs (three in Pass 31, five in
+  Pass 33, plus Pass 34's runs) passed with full output. Reproduce under load
+  with `--test-threads` above the default and full logs, and name the tests
+  before treating it as a regression; do not assume it is fixed because it has
+  not recurred.
 - **Mention-picker CPU:** reproduce the strict idle-budget failure and profile
   focus/caret, menu rendering, and idle repaint scheduling. The retained Pass 6
   paired diagnostic reproduces it on both before and after binaries.
@@ -3147,7 +3775,28 @@ These are investigation leads, not accomplished fixes:
   serialization batches, and writer retention under slow storage without
   changing ordering, failure handling, or replay behavior.
 - **Tool-event lookup:** `SessionView::tool_index` searches the full transcript
-  backwards. Measure parallel-command/subagent updates on long histories before
-  deciding whether an index is worth its memory and maintenance cost.
+  backwards. Pass 29 measured it with `tool_event_lookup_perf_probe`
+  (`cargo test --release -p flint-app --lib tool_event_lookup_perf_probe --
+  --ignored --nocapture`): 20,000 folds cost 33.100 ms with the call buried
+  under 1,500 later rows, 4.194 ms when it is the last row, and 3.606/2.527 ms
+  for four/eight interleaved calls. The worst case is ~1.6 us per delta and the
+  normal shape pays nothing, so an index is not yet worth invalidating over the
+  public `items` field. Reopen only with a workload that shows a frame cost.
+- **Restore of an interrupted approval:** Pass 35 made the *label* truthful
+  ("Not answered — the turn ended"), but the restore path itself is unchanged:
+  a log cut off before `TurnFinished` still replays an undecided card and a
+  non-zero `pending_approvals` until the post-restore sweep runs. Profile that
+  window and decide whether restore should finish the turn inline.
+- **`store_error` severity and overwriting:** Pass 36 made the image path clear
+  only its own notice, but the other writers still overwrite each other — a
+  settings-save failure can replace the stopped-writer message — and a
+  production stop still looks like a transient input refusal. Consider one
+  severity class (stop-production) that no other writer may clear, rendered
+  with a next step.
+- **Settings recovery is manual:** Pass 33 now reports a discarded
+  `config.toml` at startup and names `config.toml.invalid`, but nothing offers
+  to load or diff that file, and the check runs only at launch. Consider a
+  Settings-panel action that shows the kept file before it is overwritten by a
+  later rejection.
 - **Queue bounds:** investigate ACP event-channel backpressure and slow-storage
   retention without dropping accepted events or blocking protocol progress.

@@ -211,28 +211,46 @@ pub fn pinned(
         .into_any_element()
 }
 
+/// What the transcript says about an approval. A request the turn ended
+/// without answering is stored as a denial so it cannot be acted on, but it
+/// must not read as a decision the user made.
+pub(crate) fn label(
+    kind: ToolKind,
+    decision: Option<ApprovalDecision>,
+    ended: bool,
+) -> (IconName, String) {
+    match decision {
+        None => (
+            IconName::ShieldAlert,
+            format!("{} — waiting for you below", question(kind)),
+        ),
+        Some(ApprovalDecision::Deny) if ended => (
+            IconName::ShieldAlert,
+            "Not answered — the turn ended".to_string(),
+        ),
+        Some(ApprovalDecision::Approve) => (IconName::ShieldCheck, "Approved".to_string()),
+        Some(ApprovalDecision::ApproveAlways) => (
+            IconName::ShieldCheck,
+            "Approved broadly in this session".to_string(),
+        ),
+        Some(ApprovalDecision::Deny) => (IconName::ShieldX, "Denied".to_string()),
+    }
+}
+
 /// The transcript's record of an approval.
 pub fn record(
     kind: ToolKind,
     summary: &str,
     decision: Option<ApprovalDecision>,
+    ended: bool,
 ) -> impl IntoElement {
     let p = palette();
-    let (icon, text, color) = match decision {
-        None => (
-            IconName::ShieldAlert,
-            format!("{} — waiting for you below", question(kind)),
-            p.warning,
-        ),
-        Some(ApprovalDecision::Approve) => {
-            (IconName::ShieldCheck, "Approved".to_string(), p.success)
-        }
-        Some(ApprovalDecision::ApproveAlways) => (
-            IconName::ShieldCheck,
-            "Approved broadly in this session".to_string(),
-            p.success,
-        ),
-        Some(ApprovalDecision::Deny) => (IconName::ShieldX, "Denied".to_string(), p.danger),
+    let (icon, text) = label(kind, decision, ended);
+    let color = match decision {
+        None => p.warning,
+        Some(ApprovalDecision::Deny) if ended => p.warning,
+        Some(ApprovalDecision::Deny) => p.danger,
+        Some(ApprovalDecision::Approve | ApprovalDecision::ApproveAlways) => p.success,
     };
     div()
         .flex()

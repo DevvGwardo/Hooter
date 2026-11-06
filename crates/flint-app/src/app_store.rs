@@ -133,6 +133,14 @@ impl FlintApp {
                 Logged::TaskReviewed(review) => {
                     session.view.review_local_task(&review).unwrap_or_default()
                 }
+                // The answer given while the turn ran, so the replayed request
+                // keeps it instead of looking interrupted.
+                Logged::Approval { call_id, decision } => {
+                    let release = session.agent == flint_agent::AgentKind::Flint;
+                    session
+                        .view
+                        .resolve_approval_scoped(&call_id, decision, release)
+                }
             };
             session.apply(change);
         }

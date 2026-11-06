@@ -59,6 +59,10 @@ pub enum Item {
         kind: ToolKind,
         summary: String,
         decision: Option<ApprovalDecision>,
+        /// The turn ended with this request unanswered, and the sweep above
+        /// recorded a denial so it cannot be acted on. Distinct from a denial
+        /// the user gave, which the transcript must not misreport.
+        ended: bool,
     },
     Error(String),
     /// An undo restored these files and left the skipped ones alone.
@@ -534,12 +538,31 @@ impl SessionView {
                 kind,
                 summary,
             } => {
+                // An agent may re-ask for a call it already asked about
+                // (ACP timeouts and reconnects). One unanswered request gets
+                // one card: a duplicate card cannot be cleared separately and
+                // would leave the sidebar's count above the cards' state.
+                // An answered row never blocks a later request, because some
+                // agents reuse call ids in a following turn.
+                if self.items.iter().any(|item| {
+                    matches!(
+                        item,
+                        Item::Approval {
+                            call_id: id,
+                            decision: None,
+                            ..
+                        } if *id == call_id
+                    )
+                }) {
+                    return Change::default();
+                }
                 self.pending_approvals += 1;
                 self.push(Item::Approval {
                     call_id,
                     kind,
                     summary,
                     decision: None,
+                    ended: false,
                 })
             }
             AgentEvent::HarnessNudge { reason, message } => {
@@ -598,12 +621,17 @@ impl SessionView {
                 }
                 self.last_reason = Some(reason.clone());
                 let mut change = self.close_streams(now);
-                // Interrupted approvals must not remain actionable.
+                // Interrupted approvals must not remain actionable. They are
+                // marked as ended, so the transcript can say the request went
+                // unanswered instead of claiming the user denied it.
                 for (ix, item) in self.items.iter_mut().enumerate() {
-                    if let Item::Approval { decision, .. } = item
+                    if let Item::Approval {
+                        decision, ended, ..
+                    } = item
                         && decision.is_none()
                     {
                         *decision = Some(ApprovalDecision::Deny);
+                        *ended = true;
                         change.updated.push(ix);
                     }
                 }
