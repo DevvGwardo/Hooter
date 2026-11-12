@@ -496,3 +496,76 @@ fn research_only_negation_does_not_request_implementation() {
     guard.record_tool_call("read_file", ToolKind::Read, &json!({"path":"a.rs"}), None);
     assert_eq!(guard.before_finish(), None);
 }
+
+#[test]
+fn failed_check_fires_factual_finish_even_without_file_edits() {
+    let mut guard = TurnGuard::new("verify the build");
+    command(&mut guard, "cargo test", "test failed", 101);
+    assert_eq!(
+        guard.factual_finish(),
+        Some((
+            NudgeReason::Verify,
+            failed_check_nudge("cargo test", Some(101))
+        ))
+    );
+    assert_eq!(guard.factual_finish(), None);
+
+    let mut denied = TurnGuard::new("analyze only.\nRequired check: cargo test");
+    let mut task =
+        crate::task::TaskRecord::new(1, "analyze only.\nRequired check: cargo test".into(), 0);
+    let args = json!({"command": "cargo test"});
+    task.note_scope_denial("run_command", &args);
+    denied.set_task_record(&task);
+    denied.record_tool_call("run_command", ToolKind::Command, &args, None);
+    denied.record_tool_result(
+        "run_command",
+        ToolKind::Command,
+        &args,
+        "denied",
+        None,
+        false,
+    );
+    assert_eq!(denied.factual_finish(), None);
+}
+
+#[test]
+fn usable_child_report_counts_as_observed_work_without_watchdog() {
+    let mut guard = TurnGuard::new("implement the requested module via subagents");
+    guard.record_tool_call("read_file", ToolKind::Read, &json!({"path":"a.rs"}), None);
+    let mut task =
+        crate::task::TaskRecord::new(1, "implement the requested module via subagents".into(), 0);
+    task.children.push(crate::task::ChildAssessment {
+        session_id: "child-1".to_string(),
+        task_id: 2,
+        outcome: crate::task::TaskOutcome::NeedsReview,
+        work_revision: 1,
+        issues: Vec::new(),
+    });
+    guard.set_task_record(&task);
+    assert_eq!(guard.finish_check(), None);
+    assert_eq!(guard.before_finish(), None);
+}
+
+#[test]
+fn requires_deterministic_verification_tracks_observed_edits() {
+    let mut guard = TurnGuard::new("fix the bug");
+    let mut task = crate::task::TaskRecord::new(1, "fix the bug".into(), 0);
+    task.observed_edits = 1;
+    guard.set_task_record(&task);
+    assert!(guard.requires_deterministic_verification());
+
+    task.checks.push(crate::task::CommandEvidence {
+        id: 1,
+        call_id: "c1".to_string(),
+        command: "cargo test".to_string(),
+        contract_revision: task.contract.revision,
+        work_revision: task.work_revision,
+        started_revision: task.work_revision,
+        success: true,
+        exit_code: Some(0),
+        detail: "ok".to_string(),
+        verification: true,
+    });
+    guard.set_task_record(&task);
+    assert!(!guard.requires_deterministic_verification());
+}

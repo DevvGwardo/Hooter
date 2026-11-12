@@ -6,6 +6,7 @@ use crate::orchestration::fs::WriterLease;
 use crate::{TaskMode, TaskOutcome, TaskRecord, TaskSource, TurnEndReason};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
+use std::collections::HashMap;
 use std::io::{self, Write};
 use std::path::Path;
 
@@ -211,11 +212,6 @@ impl ImprovementStore {
         if !valid_uid(session_uid) {
             return Err(Error::SourceMismatch);
         }
-        // Unix ownership/mode/link checks below are part of this lane's
-        // contract. Do not silently weaken it on an unvalidated platform.
-        if !cfg!(unix) {
-            return Err(Error::Storage);
-        }
         private_directory_if_present(path)?;
         let lease = WriterLease::acquire(path).map_err(|_| Error::Storage)?;
         private_directory_if_present(path)?;
@@ -266,7 +262,8 @@ impl ImprovementStore {
 
     /// Call once before constructing a native turn prompt. Repeating the same
     /// boundary is idempotent and cannot activate candidates learned in that turn.
-    /// Hints never cross task IDs or contract revisions, even within a session.
+    /// Hints generalize across native work tasks and contract revisions in the
+    /// same session, never into read-only, analysis, or child turns.
     pub fn read_boundary(
         &mut self,
         turn_id: u64,
@@ -300,13 +297,10 @@ impl ImprovementStore {
         next.revision = increment(next.revision)?;
         next.boundary = Some(boundary.clone());
         let mut activated = Vec::new();
-        if next.enabled {
+        if next.enabled && scope.is_some() {
             for candidate in &mut next.candidates {
                 let evidence = &next.evidence[candidate.evidence_id as usize - 1];
-                if candidate.status == CandidateStatus::Pending
-                    && evidence.source.turn_id < turn_id
-                    && boundary.task_id == Some(evidence.source.task_id)
-                    && boundary.contract_revision == Some(evidence.source.contract_revision)
+                if candidate.status == CandidateStatus::Pending && evidence.source.turn_id < turn_id
                 {
                     candidate.status = CandidateStatus::Active;
                     candidate.activated_revision = Some(next.revision);
@@ -390,12 +384,14 @@ impl ImprovementStore {
                 },
             );
         }
-        if self.state.evidence.len() >= MAX_EVIDENCE
-            || self.state.candidates.len() + kinds.len() > MAX_CANDIDATES
-        {
-            return Err(Error::Limit);
-        }
         let mut next = self.state.clone();
+        while next.evidence.len() >= MAX_EVIDENCE
+            || next.candidates.len() + kinds.len() > MAX_CANDIDATES
+        {
+            if !evict_oldest_evidence(&mut next) {
+                return Err(Error::Limit);
+            }
+        }
         next.revision = increment(next.revision)?;
         let mut evidence = evidence;
         evidence.id = next.evidence.len() as u64 + 1;
@@ -467,21 +463,14 @@ impl ImprovementStore {
     }
 
     fn hints(&self, boundary: &Boundary) -> BoundaryHints {
-        let kinds = if self.state.enabled {
-            self.state
-                .candidates
-                .iter()
-                .filter(|candidate| {
-                    let source = &self.state.evidence[candidate.evidence_id as usize - 1].source;
-                    candidate.status == CandidateStatus::Active
-                        && boundary.task_id == Some(source.task_id)
-                        && boundary.contract_revision == Some(source.contract_revision)
-                })
-                .map(|candidate| candidate.kind)
-                .collect()
-        } else {
-            Vec::new()
-        };
+        let mut kinds = Vec::new();
+        if self.state.enabled && boundary.task_id.is_some() {
+            for candidate in &self.state.candidates {
+                if candidate.status == CandidateStatus::Active && !kinds.contains(&candidate.kind) {
+                    kinds.push(candidate.kind);
+                }
+            }
+        }
         BoundaryHints {
             revision: self.state.revision,
             turn_id: boundary.turn_id,
@@ -507,16 +496,34 @@ impl ImprovementStore {
         Ok(())
     }
 
-    fn commit(&mut self, next: RegistrySnapshot) -> Result<(), Error> {
-        validate(&next, &self.state.session_uid)?;
-        let bytes = serialize(&next)?;
-        if bytes.len() > MAX_STORE_BYTES - ROLLBACK_RESERVE_BYTES
-            && next.events.last().is_none_or(|event| {
-                event.revision != next.revision || event.action != Action::Rollback
-            })
-        {
-            return Err(Error::Limit);
-        }
+    fn commit(&mut self, mut next: RegistrySnapshot) -> Result<(), Error> {
+        let is_rollback = next.events.last().is_some_and(|event| {
+            event.revision == next.revision && event.action == Action::Rollback
+        });
+        let bytes = loop {
+            validate(&next, &self.state.session_uid)?;
+            match serialize(&next) {
+                Ok(bytes)
+                    if bytes.len() <= MAX_STORE_BYTES - ROLLBACK_RESERVE_BYTES || is_rollback =>
+                {
+                    break bytes;
+                }
+                Ok(_) | Err(Error::Limit) => {
+                    let keep_min_evidence = usize::from(matches!(
+                        next.events.last().map(|e| &e.action),
+                        Some(Action::Observed { .. })
+                    ));
+                    if next.evidence.len() > keep_min_evidence && evict_oldest_evidence(&mut next) {
+                        continue;
+                    }
+                    if evict_oldest_enabled_pair(&mut next) {
+                        continue;
+                    }
+                    return Err(Error::Limit);
+                }
+                Err(error) => return Err(error),
+            }
+        };
         self.check_disk()?;
         // A publication error can happen after rename. Never keep using a
         // possibly divergent in-memory state, even if the old file still exists.
@@ -554,21 +561,40 @@ impl ImprovementStore {
 fn eligible(task: &TaskRecord) -> bool {
     task.contract.mode == TaskMode::Work
         && task.assessment.as_ref().is_some_and(|assessment| {
-            assessment.reason == TurnEndReason::Completed
-                && matches!(
-                    assessment.outcome,
-                    TaskOutcome::Partial | TaskOutcome::NeedsReview
-                )
+            matches!(
+                assessment.reason,
+                TurnEndReason::Completed | TurnEndReason::ContinuationLimit
+            ) && matches!(
+                assessment.outcome,
+                TaskOutcome::Partial | TaskOutcome::NeedsReview
+            )
         })
         && task.blockers.is_empty()
         && task.scope_denials.is_empty()
         && task.children.is_empty()
         && task.acceptance.is_none()
         && task.automatic_review.is_none()
-        && task.continuation_stop.is_none()
         && !task.unknown_effects
         && !task.evidence_overflow
-        && task.checks.iter().all(|check| check.success)
+        && all_task_failures_recovered(&task.checks)
+}
+
+fn all_task_failures_recovered(checks: &[crate::CommandEvidence]) -> bool {
+    checks.iter().enumerate().all(|(index, check)| {
+        check.success
+            || checks[index + 1..]
+                .iter()
+                .any(|later| later.success && later.id > check.id && later.command == check.command)
+    })
+}
+
+fn all_fact_failures_recovered(checks: &[CheckFact]) -> bool {
+    checks.iter().enumerate().all(|(index, check)| {
+        check.success
+            || checks[index + 1..].iter().any(|later| {
+                later.success && later.id > check.id && later.command_sha256 == check.command_sha256
+            })
+    })
 }
 
 fn evidence(source: &EvidenceSource, task: &TaskRecord) -> Result<Evidence, Error> {
@@ -639,15 +665,97 @@ fn supports(evidence: &Evidence, kind: HintKind) -> bool {
     }
 }
 
+fn evict_oldest_evidence(state: &mut RegistrySnapshot) -> bool {
+    if state.evidence.is_empty() {
+        return false;
+    }
+    let drop_ev_id = state.evidence.remove(0).id;
+    state
+        .candidates
+        .retain(|candidate| candidate.evidence_id != drop_ev_id);
+
+    let mut evidence_map = HashMap::with_capacity(state.evidence.len());
+    for (idx, evidence) in state.evidence.iter_mut().enumerate() {
+        let new_id = idx as u64 + 1;
+        evidence_map.insert(evidence.id, new_id);
+        evidence.id = new_id;
+    }
+
+    let mut cand_map = HashMap::with_capacity(state.candidates.len());
+    for (idx, candidate) in state.candidates.iter_mut().enumerate() {
+        let new_id = idx as u64 + 1;
+        cand_map.insert(candidate.id, new_id);
+        candidate.id = new_id;
+        candidate.evidence_id = evidence_map[&candidate.evidence_id];
+    }
+
+    let old_events = std::mem::take(&mut state.events);
+    for mut event in old_events {
+        match &mut event.action {
+            Action::Observed {
+                evidence_id,
+                candidate_ids,
+            } => {
+                if *evidence_id == drop_ev_id {
+                    continue;
+                }
+                *evidence_id = evidence_map[evidence_id];
+                candidate_ids.retain_mut(|id| {
+                    if let Some(&new_id) = cand_map.get(id) {
+                        *id = new_id;
+                        true
+                    } else {
+                        false
+                    }
+                });
+                if candidate_ids.is_empty() {
+                    continue;
+                }
+            }
+            Action::Activated { candidate_ids, .. } => {
+                candidate_ids.retain_mut(|id| {
+                    if let Some(&new_id) = cand_map.get(id) {
+                        *id = new_id;
+                        true
+                    } else {
+                        false
+                    }
+                });
+                if candidate_ids.is_empty() {
+                    continue;
+                }
+            }
+            Action::Enabled { .. } | Action::Rollback => {}
+        }
+        state.events.push(event);
+    }
+    true
+}
+
+fn evict_oldest_enabled_pair(state: &mut RegistrySnapshot) -> bool {
+    for idx in 0..state.events.len().saturating_sub(1) {
+        if state.events[idx].action == (Action::Enabled { enabled: false })
+            && state.events[idx + 1].action == (Action::Enabled { enabled: true })
+        {
+            state.events.drain(idx..=idx + 1);
+            return true;
+        }
+    }
+    false
+}
+
 fn event(state: &mut RegistrySnapshot, action: Action) -> Result<(), Error> {
-    // Reserve the last audit slot for a terminal rollback, never evict history.
+    // Reserve the last audit slot for a terminal rollback; rotate older pairs or
+    // evidence entries before refusing updates.
     let limit = if action == Action::Rollback {
         MAX_EVENTS
     } else {
         MAX_EVENTS - 1
     };
-    if state.events.len() >= limit {
-        return Err(Error::Limit);
+    while state.events.len() >= limit {
+        if !(evict_oldest_enabled_pair(state) || evict_oldest_evidence(state)) {
+            return Err(Error::Limit);
+        }
     }
     state.events.push(Event {
         revision: state.revision,
@@ -760,7 +868,6 @@ fn validate(state: &RegistrySnapshot, uid: &str) -> Result<(), Error> {
         }
         for (index, check) in evidence.checks.iter().enumerate() {
             if check.id == 0
-                || !check.success
                 || !valid_digest(&check.command_sha256)
                 || check.contract_revision == 0
                 || check.contract_revision > evidence.source.contract_revision
@@ -772,6 +879,9 @@ fn validate(state: &RegistrySnapshot, uid: &str) -> Result<(), Error> {
             {
                 return Err(Error::Corrupt);
             }
+        }
+        if !all_fact_failures_recovered(&evidence.checks) {
+            return Err(Error::Corrupt);
         }
     }
     for (index, candidate) in state.candidates.iter().enumerate() {
@@ -931,39 +1041,154 @@ fn private_directory_if_present(path: &Path) -> Result<(), Error> {
     if !metadata.is_dir() || metadata.file_type().is_symlink() {
         return Err(Error::Storage);
     }
-    private_metadata(&metadata)
+    #[cfg(unix)]
+    {
+        return private_metadata(&metadata);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::{MetadataExt as _, OpenOptionsExt as _};
+        use std::os::windows::io::AsRawHandle as _;
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+        };
+        if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err(Error::Storage);
+        }
+        let dir = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(path)
+            .map_err(|_| Error::Storage)?;
+        let handle_meta = dir.metadata().map_err(|_| Error::Storage)?;
+        if !handle_meta.is_dir()
+            || handle_meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+        {
+            return Err(Error::Storage);
+        }
+        return check_windows_private_acl(dir.as_raw_handle());
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = metadata;
+        Err(Error::Storage)
+    }
 }
 
 fn private_file(lease: &WriterLease, name: &str, limit: usize) -> Result<(), Error> {
-    let metadata = lease
+    let file = lease
         .directory
         .reader(name, limit)
-        .map_err(|_| Error::Storage)?
-        .metadata()
         .map_err(|_| Error::Storage)?;
+    if crate::file_io::file_link_count(&file).map_err(|_| Error::Storage)? != 1 {
+        return Err(Error::Storage);
+    }
     #[cfg(unix)]
     {
-        use std::os::unix::fs::MetadataExt;
-        if metadata.nlink() != 1 {
-            return Err(Error::Storage);
-        }
+        let metadata = file.metadata().map_err(|_| Error::Storage)?;
+        return private_metadata(&metadata);
     }
-    private_metadata(&metadata)
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsRawHandle as _;
+        return check_windows_private_acl(file.as_raw_handle());
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = file;
+        Err(Error::Storage)
+    }
 }
 
+#[cfg(unix)]
 fn private_metadata(metadata: &std::fs::Metadata) -> Result<(), Error> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        if metadata.uid() != unsafe { libc::geteuid() } || metadata.mode() & 0o077 != 0 {
-            return Err(Error::Storage);
-        }
+    use std::os::unix::fs::MetadataExt;
+    if metadata.uid() != unsafe { libc::geteuid() } || metadata.mode() & 0o077 != 0 {
+        return Err(Error::Storage);
     }
-    #[cfg(not(unix))]
-    let _ = metadata; // Windows creation ACLs/reparse checks come from repository storage.
     Ok(())
 }
 
-#[cfg(all(test, unix))]
+#[cfg(windows)]
+fn check_windows_private_acl(handle: std::os::windows::io::RawHandle) -> Result<(), Error> {
+    use std::ptr::null_mut;
+    use windows_sys::Win32::Foundation::{HANDLE, LocalFree};
+    use windows_sys::Win32::Security::Authorization::{
+        ConvertSecurityDescriptorToStringSecurityDescriptorW, GetSecurityInfo, SE_FILE_OBJECT,
+    };
+    use windows_sys::Win32::Security::{DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR};
+
+    let mut descriptor: PSECURITY_DESCRIPTOR = null_mut();
+    let status = unsafe {
+        GetSecurityInfo(
+            handle as HANDLE,
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            null_mut(),
+            null_mut(),
+            null_mut(),
+            null_mut(),
+            &mut descriptor,
+        )
+    };
+    if status != 0 || descriptor.is_null() {
+        return Err(Error::Storage);
+    }
+    struct LocalGuard(*mut core::ffi::c_void);
+    impl Drop for LocalGuard {
+        fn drop(&mut self) {
+            if !self.0.is_null() {
+                unsafe {
+                    LocalFree(self.0);
+                }
+            }
+        }
+    }
+    let _desc_guard = LocalGuard(descriptor);
+
+    let mut text = null_mut();
+    let mut length = 0;
+    let ok = unsafe {
+        ConvertSecurityDescriptorToStringSecurityDescriptorW(
+            descriptor,
+            1,
+            DACL_SECURITY_INFORMATION,
+            &mut text,
+            &mut length,
+        )
+    };
+    if ok == 0 || text.is_null() {
+        return Err(Error::Storage);
+    }
+    let _text_guard = LocalGuard(text.cast());
+    let acl = String::from_utf16_lossy(unsafe {
+        std::slice::from_raw_parts(text, length.saturating_sub(1) as usize)
+    });
+    if !acl.starts_with("D:P") {
+        return Err(Error::Storage);
+    }
+    let mut saw_ace = false;
+    let mut rest = acl.as_str();
+    while let Some(start) = rest.find('(') {
+        let Some(end) = rest[start + 1..].find(')') else {
+            return Err(Error::Storage);
+        };
+        let ace = &rest[start + 1..start + 1 + end];
+        let mut fields = ace.split(';');
+        let ace_type = fields.next().unwrap_or("");
+        let trustee = ace.split(';').nth(5).unwrap_or("");
+        if ace_type != "A" || !matches!(trustee, "OW" | "SY") {
+            return Err(Error::Storage);
+        }
+        saw_ace = true;
+        rest = &rest[start + 1 + end + 1..];
+    }
+    if !saw_ace {
+        return Err(Error::Storage);
+    }
+    Ok(())
+}
+
+#[cfg(test)]
 #[path = "improvement_tests.rs"]
 mod tests;

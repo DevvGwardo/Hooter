@@ -828,3 +828,132 @@ async fn automatic_review_rejects_oversized_sources_before_starting_tools() {
         assert!(!task.is_automatically_verified());
     }
 }
+
+#[tokio::test]
+async fn automatic_review_rejects_hardlinks_and_expanded_credential_paths() {
+    for rel in [
+        "cert.pem",
+        "bundle.p12",
+        "keys.pfx",
+        ".aws/credentials",
+        ".ssh/config",
+        ".netrc",
+        ".npmrc",
+        "id_rsa",
+        "id_ed25519",
+    ] {
+        let (_root, ws) = temp_workspace();
+        let task = ready_task(&ws);
+        let full = ws.join(rel);
+        if let Some(parent) = full.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(&full, "fixture-secret-never-forwarded").unwrap();
+        let (url, _) = mock_server(vec![sse_tool_call(
+            "cred",
+            "read_file",
+            json!({"path": rel}),
+        )])
+        .await;
+        let events = std::sync::Mutex::new(Vec::new());
+        let result = crate::automatic_review::run(
+            &test_config(url, ws),
+            &task,
+            2,
+            &CancellationToken::new(),
+            &|event| events.lock().unwrap().push(event),
+        )
+        .await;
+        assert!(result.is_err(), "{rel}");
+        assert!(
+            !format!("{:?}", events.lock().unwrap()).contains("fixture-secret-never-forwarded")
+        );
+    }
+
+    for tool in ["read_file", "grep"] {
+        let (_root, ws) = temp_workspace();
+        let task = ready_task(&ws);
+        std::fs::write(ws.join("shared.txt"), "linked content").unwrap();
+        std::fs::hard_link(ws.join("shared.txt"), ws.join("alias.txt")).unwrap();
+        let (url, _) = mock_server(vec![sse_tool_call(
+            "hardlink",
+            tool,
+            json!({"path": "alias.txt", "pattern": "."}),
+        )])
+        .await;
+        let result = crate::automatic_review::run(
+            &test_config(url, ws),
+            &task,
+            2,
+            &CancellationToken::new(),
+            &|_| {},
+        )
+        .await;
+        assert!(
+            matches!(result, Err(ProviderError::Failed(ref error)) if error.contains("hard-linked")),
+            "expected hardlink rejection for {tool}, got {result:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn automatic_review_handles_64_tracked_files_extra_context_and_compaction() {
+    let (_root, ws) = temp_workspace();
+    let mut task = ready_task(&ws);
+    task.files.clear();
+    let payload = "x".repeat(4_000);
+    for idx in 0..64 {
+        let name = format!("f{idx:02}.txt");
+        std::fs::write(ws.join(&name), format!("file {idx}\n{payload}")).unwrap();
+        task.files.push(crate::task::FileEvidence {
+            path: name.clone(),
+            state: crate::task::file_state(&ws, &name),
+            reported: true,
+        });
+    }
+    std::fs::write(ws.join("README.md"), "extra context file").unwrap();
+    task.checks[0].detail = "log ".repeat(20_000);
+    task.assess(TurnEndReason::Completed, true);
+
+    let mut responses = Vec::new();
+    for chunk in (0..64).collect::<Vec<_>>().chunks(8) {
+        let calls: Vec<_> = chunk
+            .iter()
+            .enumerate()
+            .map(|(index, idx)| {
+                json!({
+                    "index": index,
+                    "id": format!("read-{idx}"),
+                    "type": "function",
+                    "function": {
+                        "name": "read_file",
+                        "arguments": json!({"path": format!("f{idx:02}.txt")}).to_string()
+                    }
+                })
+            })
+            .collect();
+        responses.push(sse(&[json!({
+            "choices": [{"delta": {"tool_calls": calls}, "finish_reason": "tool_calls"}]
+        })]));
+    }
+    responses.push(sse_tool_call(
+        "extra-readme",
+        "read_file",
+        json!({"path": "README.md"}),
+    ));
+    responses.push(verdict("clean", vec![]));
+
+    let (url, _) = mock_server(responses).await;
+    let review = crate::automatic_review::run(
+        &test_config(url, ws),
+        &task,
+        2,
+        &CancellationToken::new(),
+        &|_| {},
+    )
+    .await
+    .unwrap();
+    assert_eq!(review.inspected_files.len(), 64);
+    task.record_automatic_review(review).unwrap();
+    assert!(task.is_automatically_verified());
+}

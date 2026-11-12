@@ -9,9 +9,13 @@ use crate::provider::{ChatRequest, Message, Provider, ProviderError};
 use crate::task::{AutomaticReview, FileEvidence, FileState, TaskRecord, file_state};
 use crate::{AgentConfig, AgentEvent, Usage, tools};
 
+use std::collections::HashSet;
+
 const FINISH_REVIEW: &str = "finish_review";
 const MAX_STEPS: u32 = 16;
 const MAX_CONTEXT_BYTES: usize = 128 * 1024;
+const MAX_TRACKED_FILES: usize = 64;
+const MAX_INSPECTED_FILES: usize = 128;
 
 async fn review_io<T: Send + 'static>(
     cancel: &CancellationToken,
@@ -38,8 +42,78 @@ fn credential_path(path: &Path) -> bool {
         part == ".git"
             || part.starts_with(".env")
             || part == "credentials"
+            || part == ".aws"
+            || part == ".ssh"
+            || part == ".netrc"
+            || part == ".npmrc"
+            || part == "id_rsa"
+            || part == "id_ed25519"
             || part.ends_with(".key")
+            || part.ends_with(".pem")
+            || part.ends_with(".p12")
+            || part.ends_with(".pfx")
     })
+}
+
+fn serialize_task_evidence(task: &TaskRecord) -> Result<String, ProviderError> {
+    let evidence = serde_json::to_string(task).expect("task serializes");
+    if evidence.len() <= MAX_CONTEXT_BYTES / 2 {
+        return Ok(evidence);
+    }
+    let mut compact = task.clone();
+    for check in &mut compact.checks {
+        if check.detail.len() > 256 {
+            check.detail = tools::head_tail(&check.detail, 256);
+        }
+    }
+    if let Some(report) = &mut compact.report
+        && report.len() > 2_048
+    {
+        *report = tools::head_tail(report, 2_048);
+    }
+    let compact_json = serde_json::to_string(&compact).expect("task serializes");
+    if compact_json.len() <= MAX_CONTEXT_BYTES * 3 / 4 {
+        Ok(compact_json)
+    } else {
+        Err(ProviderError::Failed(
+            "Task evidence exceeds the independent review budget.".into(),
+        ))
+    }
+}
+
+fn compact_review_messages(messages: &mut [Message], budget: usize) {
+    if serde_json::to_vec(messages)
+        .expect("messages serialize")
+        .len()
+        <= budget
+    {
+        return;
+    }
+    // Preserve the system/user prompt and the most recent assistant+tool turn,
+    // compacting older inspection payloads first so multi-file reviews fit.
+    let keep_from = messages
+        .iter()
+        .rposition(|msg| matches!(msg, Message::Assistant { .. }))
+        .unwrap_or(messages.len());
+    for message in messages.iter_mut().take(keep_from) {
+        if let Message::Tool { content, .. } = message
+            && content.len() > 128
+        {
+            *content = "[Earlier review output compacted; re-read if needed.]".into();
+        }
+    }
+    if serde_json::to_vec(messages)
+        .expect("messages serialize")
+        .len()
+        <= budget
+    {
+        return;
+    }
+    for message in messages.iter_mut().take(keep_from) {
+        if let Message::Assistant { reasoning, .. } = message {
+            reasoning.clear();
+        }
+    }
 }
 
 async fn inspect_path(
@@ -82,14 +156,16 @@ async fn inspect_path(
                 "Independent review reads and searches require a single regular file; list directories before inspecting individual files.".into(),
             ));
         }
-        #[cfg(unix)]
+        let file = crate::file_io::open_regular_file(&resolved).map_err(|_| {
+            ProviderError::Failed("Independent review source is not accessible.".into())
+        })?;
+        if crate::file_io::file_link_count(&file).map_err(|_| {
+            ProviderError::Failed("Independent review source is not accessible.".into())
+        })? != 1
         {
-            use std::os::unix::fs::MetadataExt as _;
-            if metadata.nlink() != 1 {
-                return Err(ProviderError::Failed(
-                    "Independent review cannot inspect hard-linked files.".into(),
-                ));
-            }
+            return Err(ProviderError::Failed(
+                "Independent review cannot inspect hard-linked files.".into(),
+            ));
         }
         let state = file_state(&workspace, &resolved.to_string_lossy());
         if !matches!(state, FileState::Present { .. }) {
@@ -112,12 +188,7 @@ pub(crate) async fn run(
     if cancel.is_cancelled() {
         return Err(ProviderError::Cancelled);
     }
-    let evidence = serde_json::to_string(task).expect("task serializes");
-    if evidence.len() > MAX_CONTEXT_BYTES / 2 {
-        return Err(ProviderError::Failed(
-            "Task evidence exceeds the independent review budget.".into(),
-        ));
-    }
+    let evidence = serialize_task_evidence(task)?;
     let mut specs: Vec<_> = tools::tool_specs()
         .into_iter()
         .filter(|spec| {
@@ -189,12 +260,14 @@ pub(crate) async fn run(
             "Protected task and host-observed evidence:\n{evidence}"
         )),
     ];
+    let tracked_set: HashSet<&str> = task.files.iter().map(|file| file.path.as_str()).collect();
     let mut inspected = Vec::<FileEvidence>::new();
     let mut usage = Usage::default();
     for step in 1..=MAX_STEPS {
         if cancel.is_cancelled() {
             return Err(ProviderError::Cancelled);
         }
+        compact_review_messages(&mut messages, MAX_CONTEXT_BYTES);
         if serde_json::to_vec(&messages)
             .expect("messages serialize")
             .len()
@@ -241,6 +314,7 @@ pub(crate) async fn run(
             reasoning: completion.reasoning,
             tool_calls: completion.tool_calls.clone(),
         });
+        compact_review_messages(&mut messages, MAX_CONTEXT_BYTES);
         if serde_json::to_vec(&messages)
             .expect("messages serialize")
             .len()
@@ -366,10 +440,19 @@ pub(crate) async fn run(
                     if inspected.iter().any(|file| file.path == path) {
                         continue;
                     }
-                    if inspected.len() == 64 {
-                        return Err(ProviderError::Failed(
-                            "Independent review file budget exhausted.".into(),
-                        ));
+                    let is_tracked = tracked_set.contains(path.as_str());
+                    let additional_untracked = inspected
+                        .iter()
+                        .filter(|file| !tracked_set.contains(file.path.as_str()))
+                        .count();
+                    if !is_tracked
+                        && task.files.len().saturating_add(additional_untracked)
+                            >= MAX_TRACKED_FILES
+                    {
+                        continue;
+                    }
+                    if inspected.len() >= MAX_INSPECTED_FILES {
+                        continue;
                     }
                     inspected.push(FileEvidence {
                         path,

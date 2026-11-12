@@ -500,7 +500,7 @@ impl Harness {
     ) -> FinishDecision {
         self.continuation_stop = None;
         let nudge = if self.guard.has_blockers() {
-            if !self.blocker_recovery_nudged && self.guard.can_recover_blocker() {
+            let recovery = if !self.blocker_recovery_nudged && self.guard.can_recover_blocker() {
                 self.blocker_recovery_nudged = true;
                 let mut state = self.guard.blocker_state(final_text);
                 state["available_tools"] = serde_json::json!(
@@ -527,7 +527,13 @@ impl Harness {
                 })
             } else {
                 None
-            }
+            };
+            recovery
+                .or_else(|| {
+                    leaked::detect_leaked_tool_call(final_text, tool_names)
+                        .map(|call| (NudgeReason::LeakedCall, leaked::leaked_call_nudge(&call)))
+                })
+                .or_else(|| self.guard.factual_finish())
         } else if let Some(message) = self.guard.analysis_scope_nudge(final_text) {
             Some((NudgeReason::Watchdog, message))
         } else {
@@ -586,7 +592,7 @@ impl Harness {
                     .await
                 {
                     self.guard.mark_nudged(FinishCheck::Verify);
-                    return if confirmed {
+                    return if confirmed || self.guard.requires_deterministic_verification() {
                         Some((NudgeReason::Verify, self.guard.verification_nudge()))
                     } else {
                         self.guard.factual_finish()

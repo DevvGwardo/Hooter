@@ -11,7 +11,11 @@ pub(crate) struct CommandEvidence {
 }
 
 pub(crate) fn classify(command: &str) -> CommandEvidence {
-    let Some(parts) = shell_parts(command) else {
+    classify_with(command, cfg!(windows))
+}
+
+fn classify_with(command: &str, windows: bool) -> CommandEvidence {
+    let Some(parts) = shell_parts_with(command, windows) else {
         return CommandEvidence {
             // A shell test still owns its final exit status when its operands
             // expand. Those expansions remain potentially mutating.
@@ -23,7 +27,7 @@ pub(crate) fn classify(command: &str) -> CommandEvidence {
     let mut verification = false;
     let mut mutates = false;
     for (part, sequence) in parts {
-        let Some(words) = shlex::split(part) else {
+        let Some(words) = split_words_with(part, windows) else {
             return CommandEvidence {
                 verification: false,
                 mutates: true,
@@ -32,13 +36,16 @@ pub(crate) fn classify(command: &str) -> CommandEvidence {
         let words: Vec<_> = words.iter().map(String::as_str).collect();
         let words = executable_words(&words);
         let check = is_check(words);
-        if sequence {
-            // A semicolon/newline doesn't propagate an earlier command's exit.
+        let part_mutates = !check_without_source_writes(words) && !inspection(words);
+        if sequence || part_mutates {
+            // A semicolon/newline doesn't propagate an earlier command's exit,
+            // and a subsequent mutating or unknown-effect part invalidates any
+            // earlier verification check.
             verification = check;
         } else {
             verification |= check;
         }
-        mutates |= !check_without_source_writes(words) && !inspection(words);
+        mutates |= part_mutates;
     }
     CommandEvidence {
         verification,
@@ -52,7 +59,7 @@ pub(crate) fn verification_rejection(command: &str) -> Option<&'static str> {
         return None;
     }
     let attempted = command.split(['&', '|', ';', '\n']).any(|part| {
-        shlex::split(part).is_some_and(|words| {
+        split_words_with(part, cfg!(windows)).is_some_and(|words| {
             let words: Vec<_> = words.iter().map(String::as_str).collect();
             is_check(executable_words(&words))
         })
@@ -88,22 +95,24 @@ pub(crate) fn is_unexecuted_python_check(command: &str, detail: &str) -> bool {
     {
         return false;
     }
-    let Some(parts) = shell_parts(command) else {
+    let Some(parts) = shell_parts_with(command, cfg!(windows)) else {
         return false;
     };
     if parts.len() != 1 {
         return false;
     }
-    let Some(words) = shlex::split(parts[0].0) else {
+    let Some(words) = split_words_with(parts[0].0, cfg!(windows)) else {
         return false;
     };
-    if words.len() != 3
-        || !matches!(words[0].rsplit('/').next(), Some("python" | "python3"))
-        || words[1] != "-c"
-    {
+    let word_refs: Vec<_> = words.iter().map(String::as_str).collect();
+    let Some((first, rest)) = word_refs.split_first() else {
         return false;
-    }
-    let code = words[2].as_bytes();
+    };
+    let program = program_name(first);
+    let Some(["-c", code]) = python_args(&program, rest) else {
+        return false;
+    };
+    let code = code.as_bytes();
     let (mut quote, mut comment, mut invalid, mut i) = (None, false, false, 0);
     while i < code.len() {
         let c = code[i];
@@ -148,12 +157,73 @@ pub(crate) fn is_unexecuted_python_check(command: &str, detail: &str) -> bool {
     invalid && quote.is_none()
 }
 
+fn program_name(program: &str) -> String {
+    let base = program.rsplit(['/', '\\']).next().unwrap_or(program);
+    let lower = base.to_ascii_lowercase();
+    for ext in [".exe", ".cmd", ".bat"] {
+        if let Some(stripped) = lower.strip_suffix(ext) {
+            return stripped.to_string();
+        }
+    }
+    lower
+}
+
+fn is_py_launcher_version_flag(flag: &str) -> bool {
+    let Some(rest) = flag.strip_prefix('-') else {
+        return false;
+    };
+    !rest.is_empty()
+        && rest.starts_with(|c: char| c.is_ascii_digit())
+        && rest
+            .chars()
+            .all(|c| c.is_ascii_digit() || matches!(c, '.' | '-'))
+}
+
+fn python_args<'a>(program: &str, args: &'a [&'a str]) -> Option<&'a [&'a str]> {
+    match program {
+        "python" | "python3" => Some(args),
+        "py" => {
+            if let Some((first, rest)) = args.split_first()
+                && is_py_launcher_version_flag(first)
+            {
+                Some(rest)
+            } else {
+                Some(args)
+            }
+        }
+        _ => None,
+    }
+}
+
+fn has_mutating_check_flag(words: &[&str]) -> bool {
+    words.iter().any(|word| {
+        matches!(*word, "--fix" | "--fix-only" | "--write" | "-w")
+            || word.starts_with("--fix=")
+            || word.starts_with("--fix-only=")
+            || word.starts_with("--write=")
+    })
+}
+
 fn is_check(words: &[&str]) -> bool {
+    if has_mutating_check_flag(words) {
+        return false;
+    }
     let Some((program, args)) = words.split_first() else {
         return false;
     };
-    let program = program.rsplit('/').next().unwrap_or(program);
-    match (program, args) {
+    let program = program_name(program);
+    if let Some(py_args) = python_args(&program, args) {
+        return match py_args {
+            ["-m", "pytest" | "unittest" | "py_compile", ..] => true,
+            ["-c", code, ..] => code.contains("assert "),
+            [script, ..] => std::path::Path::new(script)
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("test_") || name.starts_with("validate")),
+            _ => false,
+        };
+    }
+    match (program.as_str(), args) {
         ("test" | "pytest" | "pytest-3" | "jest" | "vitest" | "mypy" | "eslint", _) => true,
         ("cargo", ["test" | "check" | "clippy" | "build", ..]) => true,
         ("cargo", ["fmt", rest @ ..]) => rest.contains(&"--check"),
@@ -184,26 +254,19 @@ fn is_check(words: &[&str]) -> bool {
         }
         ("ruff", ["check", ..]) | ("biome", ["check" | "lint", ..]) => true,
         ("ruff", ["format", rest @ ..]) => rest.contains(&"--check"),
-        ("python" | "python3", ["-m", "pytest" | "unittest", ..]) => true,
-        ("python" | "python3", ["-c", code, ..]) => code.contains("assert "),
-        ("python" | "python3", [script, ..]) => std::path::Path::new(script)
-            .file_name()
-            .and_then(|name| name.to_str())
-            .is_some_and(|name| name.starts_with("test_") || name.starts_with("validate")),
         _ => false,
     }
 }
 
 fn check_without_source_writes(words: &[&str]) -> bool {
+    let inline_python = words.split_first().is_some_and(|(program, args)| {
+        let program = program_name(program);
+        python_args(&program, args).is_some_and(|py_args| matches!(py_args, ["-c", ..]))
+    });
     is_check(words)
-        && !words.iter().any(|word| {
-            matches!(*word, "--fix" | "--write" | "-w")
-                || word.starts_with("--fix=")
-                || word.starts_with("--write=")
-                || word.starts_with("--output")
-        })
+        && !words.iter().any(|word| word.starts_with("--output"))
         // Inline assertions can also contain arbitrary mutations.
-        && !matches!(words, ["python" | "python3", "-c", ..])
+        && !inline_python
 }
 
 fn inspection(words: &[&str]) -> bool {
@@ -217,8 +280,8 @@ fn inspection(words: &[&str]) -> bool {
             || word.starts_with("--ext-diff")
             || word.starts_with("--textconv")
     }) && words.first().is_some_and(|program| {
-        let program = program.rsplit('/').next().unwrap_or(program);
-        match program {
+        let program = program_name(program);
+        match program.as_str() {
             "cargo" | "npm" | "pnpm" | "yarn" | "bun" | "go" | "rustc" | "rustfmt"
                 if matches!(&words[1..], ["--version" | "-V" | "--help" | "-h"]) =>
             {
@@ -232,16 +295,94 @@ fn inspection(words: &[&str]) -> bool {
             }),
             // An awk program can invoke a command or write a file.
             "awk" => false,
-            _ => is_inspection(program),
+            _ => is_inspection(&program),
         }
     })
+}
+
+fn has_windows_percent_expansion(command: &str) -> bool {
+    let bytes = command.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' {
+            let next = bytes.get(i + 1).copied();
+            if matches!(next, Some(b'0'..=b'9' | b'*' | b'~')) {
+                return true;
+            }
+            // Reject paired %VAR% (no whitespace between the pair).
+            let mut j = i + 1;
+            while j < bytes.len() && !bytes[j].is_ascii_whitespace() {
+                if bytes[j] == b'%' && j > i + 1 {
+                    return true;
+                }
+                j += 1;
+            }
+        }
+        i += 1;
+    }
+    false
+}
+
+fn has_windows_bang_expansion(command: &str) -> bool {
+    // cmd delayed expansion (`!VAR!`) uses paired bangs. Single `!` or `!=`
+    // operators cannot expand environment variables.
+    let non_operator_bangs = command
+        .as_bytes()
+        .windows(2)
+        .filter(|pair| pair[0] == b'!' && pair[1] != b'=')
+        .count()
+        + usize::from(command.ends_with('!') && !command.ends_with("!="));
+    non_operator_bangs >= 2
+}
+
+fn split_words_with(part: &str, windows: bool) -> Option<Vec<String>> {
+    if !windows {
+        return shlex::split(part);
+    }
+    let mut words = Vec::new();
+    let mut current = String::new();
+    let mut in_word = false;
+    let mut quote = None;
+    for c in part.chars() {
+        if let Some(q) = quote {
+            if c == q {
+                quote = None;
+            } else {
+                current.push(c);
+            }
+            continue;
+        }
+        match c {
+            '\'' | '"' => {
+                quote = Some(c);
+                in_word = true;
+            }
+            c if c.is_ascii_whitespace() => {
+                if in_word {
+                    words.push(std::mem::take(&mut current));
+                    in_word = false;
+                }
+            }
+            _ => {
+                current.push(c);
+                in_word = true;
+            }
+        }
+    }
+    if quote.is_some() {
+        return None;
+    }
+    if in_word {
+        words.push(current);
+    }
+    Some(words)
 }
 
 /// A deliberately small foreground grammar. Expansions, redirection,
 /// conditionals and pipelines cannot reliably attribute a check's exit code.
 /// Quoted punctuation is data, not another command.
-fn shell_parts(command: &str) -> Option<Vec<(&str, bool)>> {
-    if cfg!(windows) && command.contains(['%', '!', '^']) {
+fn shell_parts_with(command: &str, windows: bool) -> Option<Vec<(&str, bool)>> {
+    if windows && (has_windows_percent_expansion(command) || has_windows_bang_expansion(command)) {
         return None;
     }
     let mut quote = None;
@@ -255,7 +396,7 @@ fn shell_parts(command: &str) -> Option<Vec<(&str, bool)>> {
             escaped = false;
             continue;
         }
-        if c == '\\' && quote != Some('\'') {
+        if !windows && c == '\\' && quote != Some('\'') {
             escaped = true;
             continue;
         }
@@ -266,6 +407,9 @@ fn shell_parts(command: &str) -> Option<Vec<(&str, bool)>> {
             continue;
         }
         if matches!(c, '$' | '`') {
+            return None;
+        }
+        if windows && c == '^' && quote != Some('"') {
             return None;
         }
         if let Some(q) = quote {
@@ -421,5 +565,84 @@ mod tests {
         assert!(verification_rejection("bun run typecheck; echo done").is_some());
         assert!(verification_rejection("bun test").is_none());
         assert!(!classify("bun run arbitrary").verification);
+    }
+
+    #[test]
+    fn mutating_parts_after_check_and_fix_flags_invalidate_verification() {
+        for command in [
+            "cargo test && touch tampered",
+            "cargo test && unknown-helper --arg",
+            "cargo test && ruff check --fix-only src",
+            "ruff check --fix-only src",
+            "ruff check --fix src",
+            "npx eslint --fix src",
+            "prettier --write src",
+            "prettier -w src",
+            "cargo clippy --fix --allow-dirty",
+            "biome check --write src",
+            "bun run lint --fix",
+        ] {
+            assert_eq!(
+                classify(command),
+                CommandEvidence {
+                    verification: false,
+                    mutates: true,
+                },
+                "{command}"
+            );
+        }
+    }
+
+    #[test]
+    fn windows_paths_extensions_and_py_launcher_classify_cleanly() {
+        for command in [
+            r"C:\Python312\python.exe -m pytest",
+            r#""C:\Program Files\Python312\PY.EXE" -3 -m unittest"#,
+            "py -m pytest",
+            "py -3.11 -m py_compile app.py",
+            r".\node_modules\.bin\tsc.cmd --noEmit",
+            r".\node_modules\.bin\ESLINT.CMD src",
+            "CARGO.EXE test",
+            r"C:\tools\pytest.bat -k test_ok",
+        ] {
+            assert_eq!(
+                classify_with(command, true),
+                CommandEvidence {
+                    verification: true,
+                    mutates: false,
+                },
+                "{command}"
+            );
+        }
+        assert_eq!(
+            classify_with(r#"py -c "assert 5 % 2 == 1 and 1 != 2""#, true),
+            CommandEvidence {
+                verification: true,
+                mutates: true,
+            }
+        );
+        assert_eq!(
+            classify_with(r#"C:\Python312\python.exe test_app.py"#, true),
+            CommandEvidence {
+                verification: true,
+                mutates: false,
+            }
+        );
+        for unsafe_win in [
+            "cargo test && touch tampered",
+            "git status %INJECT%",
+            "git status !INJECT!",
+            "git status ^& echo changed",
+            r"C:\tools\ruff.exe check --fix-only src",
+        ] {
+            assert_eq!(
+                classify_with(unsafe_win, true),
+                CommandEvidence {
+                    verification: false,
+                    mutates: true,
+                },
+                "{unsafe_win}"
+            );
+        }
     }
 }

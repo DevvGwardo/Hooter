@@ -43,7 +43,7 @@ impl Session {
         let description = snapshot.as_ref().map_or_else(
             || "Reminder learning is unavailable. Baseline task execution is unchanged. No saved registry was overwritten.".into(),
             |snapshot| format!(
-                "Data-only verification reminders, revision {} ({} candidates). Applied only at a later turn boundary for the same task and scope. Rollback disables learning and retires all candidates. Never changes code, tools, approvals, checks or budgets.",
+                "Data-only verification reminders, revision {} ({} candidates). Applied across work tasks and revisions at later turn boundaries. Rollback disables learning and retires all candidates. Never changes code, tools, approvals, checks or budgets.",
                 snapshot.revision, snapshot.candidates.len(),
             ),
         );
@@ -115,13 +115,19 @@ impl Session {
                 }
                 self.publish_improvement_option();
             }
+            Err(crate::improvement::Error::Limit) => {
+                self.publish_improvement_option();
+            }
             Err(_) => self.improvement_failed(),
         }
     }
 
     pub(super) fn learn_completed_task(&mut self, reason: &TurnEndReason) {
         if self.child
-            || *reason != TurnEndReason::Completed
+            || !matches!(
+                reason,
+                TurnEndReason::Completed | TurnEndReason::ContinuationLimit
+            )
             || self
                 .task
                 .as_ref()
@@ -147,10 +153,11 @@ impl Session {
                 task,
             )
         });
-        if result.is_err() {
-            self.improvement_failed();
-        } else {
-            self.publish_improvement_option();
+        match result {
+            Ok(_) | Err(crate::improvement::Error::Limit) => {
+                self.publish_improvement_option();
+            }
+            Err(_) => self.improvement_failed(),
         }
     }
 
@@ -161,14 +168,10 @@ impl Session {
         let Some(task) = &self.task else {
             return String::new();
         };
-        let Some((id, revision, kinds)) = &self.boundary_hints else {
+        let Some((_, _, kinds)) = &self.boundary_hints else {
             return String::new();
         };
-        if task.contract.mode != TaskMode::Work
-            || *id != task.contract.id
-            || *revision != task.contract.revision
-            || kinds.is_empty()
-        {
+        if task.contract.mode != TaskMode::Work || kinds.is_empty() {
             return String::new();
         }
         format!(

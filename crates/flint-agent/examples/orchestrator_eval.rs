@@ -69,7 +69,7 @@ async fn main() -> anyhow::Result<()> {
         ExecutionOptions {
             allow_subagents: run.allow_subagents,
             interactive_ui: false,
-            improvement_hints: false,
+            improvement_hints: true,
         },
     );
     handle.ops.send(Op::UserMessage(run.prompt)).await?;

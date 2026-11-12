@@ -225,7 +225,6 @@ fn active_interrupted_failed_limited_and_blocked_tasks_are_ignored() {
         Some(TurnEndReason::Interrupted),
         Some(TurnEndReason::Failed("failure".into())),
         Some(TurnEndReason::StepLimit),
-        Some(TurnEndReason::ContinuationLimit),
     ] {
         let (_root, mut store) = store();
         let mut task = task();
@@ -251,6 +250,38 @@ fn active_interrupted_failed_limited_and_blocked_tasks_are_ignored() {
             .observe_completed_task(&source(&task, 1), &task)
             .unwrap(),
         Observation::Ignored
+    );
+}
+
+#[test]
+fn continuation_limit_and_recovered_failure_trajectories_can_learn_hints() {
+    let (_root, mut store1) = store();
+    let mut limited = task();
+    limited.assessment.as_mut().unwrap().reason = TurnEndReason::ContinuationLimit;
+    limited.continuation_stop = Some(crate::ContinuationStop {
+        cause: crate::ContinuationStopCause::BudgetExhausted,
+        followups: 2,
+        condition: "Run verification".into(),
+    });
+    stage(&mut store1, &limited);
+    assert_eq!(
+        store1.read_boundary(2, Some(&limited)).unwrap().kinds,
+        vec![HintKind::DirectVerificationReminder]
+    );
+
+    let (_root2, mut store2) = store();
+    let mut recovered = task();
+    let mut failed = check(&recovered, recovered.work_revision - 1);
+    failed.id = 1;
+    failed.success = false;
+    failed.exit_code = Some(101);
+    let mut passed = check(&recovered, recovered.work_revision - 1);
+    passed.id = 2;
+    recovered.checks = vec![failed, passed];
+    stage(&mut store2, &recovered);
+    assert_eq!(
+        store2.read_boundary(2, Some(&recovered)).unwrap().kinds,
+        vec![HintKind::FreshVerificationReminder]
     );
 }
 
@@ -363,7 +394,7 @@ fn source_session_task_revision_and_boundary_must_all_match() {
 }
 
 #[test]
-fn ordered_boundaries_and_task_scope_are_enforced() {
+fn ordered_boundaries_generalize_across_work_tasks_and_respect_readonly_scope() {
     let (_root, mut store) = store();
     let task = task();
     assert_eq!(
@@ -378,12 +409,9 @@ fn ordered_boundaries_and_task_scope_are_enforced() {
         store.read_boundary(1, Some(&unrelated)),
         Err(Error::BoundaryOrder)
     );
-    assert!(
-        store
-            .read_boundary(2, Some(&unrelated))
-            .unwrap()
-            .kinds
-            .is_empty()
+    assert_eq!(
+        store.read_boundary(2, Some(&unrelated)).unwrap().kinds,
+        vec![HintKind::DirectVerificationReminder]
     );
     assert_eq!(
         store.read_boundary(1, Some(&task)),
@@ -394,9 +422,16 @@ fn ordered_boundaries_and_task_scope_are_enforced() {
     let mut revised = task.clone();
     revised.contract.revision += 1;
     finish(&mut revised);
+    assert_eq!(
+        store.read_boundary(5, Some(&revised)).unwrap().kinds,
+        vec![HintKind::DirectVerificationReminder]
+    );
+    let mut readonly = task.clone();
+    readonly.contract.mode = TaskMode::ReadOnly;
+    finish(&mut readonly);
     assert!(
         store
-            .read_boundary(5, Some(&revised))
+            .read_boundary(6, Some(&readonly))
             .unwrap()
             .kinds
             .is_empty()
@@ -621,7 +656,7 @@ fn bounded_task_hash_rejects_oversize_without_staging() {
 }
 
 #[test]
-fn candidate_cap_is_atomic_and_keeps_rollback_available() {
+fn candidate_cap_evicts_oldest_cleanly_and_keeps_rollback_available() {
     let (_root, mut store) = store();
     for index in 0..MAX_CANDIDATES {
         let mut task = task();
@@ -639,31 +674,41 @@ fn candidate_cap_is_atomic_and_keeps_rollback_available() {
     finish(&mut task);
     let turn = MAX_CANDIDATES as u64 + 1;
     store.read_boundary(turn, Some(&task)).unwrap();
-    let full = store.inspect().unwrap();
-    assert_eq!(
+    assert!(matches!(
         store.observe_completed_task(&source(&task, turn), &task),
-        Err(Error::Limit)
+        Ok(Observation::Staged { .. })
+    ));
+    let state = store.inspect().unwrap();
+    assert_eq!(state.candidates.len(), MAX_CANDIDATES);
+    assert!(
+        state
+            .evidence
+            .iter()
+            .any(|evidence| evidence.source.task_id == 999)
     );
-    assert_eq!(store.inspect().unwrap(), full);
+    assert!(
+        !state
+            .evidence
+            .iter()
+            .any(|evidence| evidence.source.task_id == 1)
+    );
     store.rollback().unwrap();
     assert!(!store.inspect().unwrap().enabled);
 }
 
 #[test]
-fn event_cap_reserves_one_terminal_rollback_slot() {
+fn event_cap_rotates_cleanly_and_reserves_rollback_slot() {
     let (_root, mut store) = store();
     stage(&mut store, &task());
-    for _ in 0..MAX_EVENTS - 2 {
+    for _ in 0..(MAX_EVENTS + 16) {
         store
             .set_enabled(!store.inspect().unwrap().enabled)
             .unwrap();
     }
-    assert_eq!(store.set_enabled(false), Err(Error::Limit));
+    assert!(store.inspect().unwrap().events.len() < MAX_EVENTS);
     store.rollback().unwrap();
-    assert_eq!(store.inspect().unwrap().events.len(), MAX_EVENTS);
+    assert!(store.inspect().unwrap().events.len() <= MAX_EVENTS);
     assert!(!store.inspect().unwrap().enabled);
-    assert_eq!(store.set_enabled(true), Err(Error::Limit));
-    store.rollback().unwrap();
 }
 
 #[cfg(unix)]
@@ -712,6 +757,62 @@ fn public_directory_is_rejected_without_chmod_or_writing() {
     assert!(!path.join(FILE).exists());
 }
 
+#[cfg(windows)]
+#[test]
+fn windows_private_acls_hardlink_and_junction_defenses() {
+    let (root, mut store) = store();
+    let path = root.path().join("improvement");
+    let mut initial = task();
+    stage(&mut store, &initial);
+    drop(store);
+
+    // Public/inherited ACL directory pre-created by std::fs is rejected without writing.
+    let public_dir = root.path().join("public-improvement");
+    std::fs::create_dir(&public_dir).unwrap();
+    assert!(matches!(
+        ImprovementStore::open(&public_dir, UID),
+        Err(Error::Storage)
+    ));
+    assert!(!public_dir.join(FILE).exists());
+
+    // Hardlinked registry.json is rejected.
+    std::fs::hard_link(path.join(FILE), root.path().join("linked-registry.json")).unwrap();
+    assert!(matches!(
+        ImprovementStore::open(&path, UID),
+        Err(Error::Storage)
+    ));
+    std::fs::remove_file(root.path().join("linked-registry.json")).unwrap();
+
+    // NTFS directory junction is rejected.
+    let junction = root.path().join("junction-improvement");
+    let status = std::process::Command::new("cmd")
+        .arg("/c")
+        .arg("mklink")
+        .arg("/J")
+        .arg(&junction)
+        .arg(&path)
+        .status()
+        .unwrap();
+    assert!(status.success());
+    assert!(matches!(
+        ImprovementStore::open(&junction, UID),
+        Err(Error::Storage)
+    ));
+
+    // Reopening the real private directory still succeeds cleanly.
+    initial.contract.id = 8;
+    finish(&mut initial);
+    let mut reopened = ImprovementStore::open(&path, UID).unwrap();
+    assert_eq!(
+        reopened
+            .read_boundary(2, Some(&initial))
+            .unwrap()
+            .kinds
+            .len(),
+        1
+    );
+}
+
 #[test]
 fn uid_validation_prevents_paths_and_prompt_text() {
     let root = tempfile::tempdir().unwrap();
@@ -741,9 +842,8 @@ fn conflicting_evidence_for_the_same_receipt_is_rejected() {
 }
 
 #[test]
-fn byte_cap_preserves_atomicity_and_rollback_space() {
+fn byte_cap_evicts_oldest_cleanly_and_keeps_rollback_space() {
     let (_root, mut store) = store();
-    let mut reached_byte_cap = false;
     for index in 0..MAX_CANDIDATES {
         let mut task = task();
         task.contract.id = index as u64 + 1;
@@ -757,19 +857,13 @@ fn byte_cap_preserves_atomicity_and_rollback_space() {
         finish(&mut task);
         let turn = index as u64 + 1;
         store.read_boundary(turn, Some(&task)).unwrap();
-        let before = store.inspect().unwrap();
-        match store.observe_completed_task(&source(&task, turn), &task) {
-            Ok(Observation::Staged { .. }) => {}
-            Err(Error::Limit) => {
-                assert!(before.candidates.len() < MAX_CANDIDATES);
-                assert_eq!(store.inspect().unwrap(), before);
-                reached_byte_cap = true;
-                break;
-            }
-            other => panic!("unexpected result: {other:?}"),
-        }
+        assert!(matches!(
+            store.observe_completed_task(&source(&task, turn), &task),
+            Ok(Observation::Staged { .. })
+        ));
+        assert!(store.saved.len() <= MAX_STORE_BYTES - ROLLBACK_RESERVE_BYTES);
     }
-    assert!(reached_byte_cap);
+    assert!(store.inspect().unwrap().evidence.len() < MAX_CANDIDATES);
     store.rollback().unwrap();
     assert!(store.saved.len() <= MAX_STORE_BYTES);
     assert!(!store.inspect().unwrap().enabled);

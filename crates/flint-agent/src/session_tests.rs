@@ -711,7 +711,7 @@ async fn a_jev_verdict_that_confirms_an_edit_reaches_the_event_stream() {
 }
 
 #[tokio::test]
-async fn a_jev_verdict_that_clears_an_edit_skips_the_nudge() {
+async fn a_jev_verdict_cannot_skip_deterministic_verification_after_observed_edits() {
     let (_guard, ws) = temp_workspace();
     let (url, _) = mock_server(vec![
         sse_tool_call(
@@ -720,6 +720,7 @@ async fn a_jev_verdict_that_clears_an_edit_skips_the_nudge() {
             json!({"path": "a.py", "content": "x = 1\n"}),
         ),
         sse_text("Done."),
+        sse_text("Done, still unverified."),
     ])
     .await;
     let (judge_url, judged) = mock_judge(0.9).await;
@@ -742,11 +743,13 @@ async fn a_jev_verdict_that_clears_an_edit_skips_the_nudge() {
         }),
         Some((JevQuestion::Verified, 0.9, false))
     );
-    assert!(
-        !events
-            .iter()
-            .any(|event| matches!(event, AgentEvent::HarnessNudge { .. }))
-    );
+    assert!(events.iter().any(|event| matches!(
+        event,
+        AgentEvent::HarnessNudge {
+            reason: NudgeReason::Verify,
+            ..
+        }
+    )));
     assert_eq!(
         outline(&events),
         vec![
@@ -755,10 +758,49 @@ async fn a_jev_verdict_that_clears_an_edit_skips_the_nudge() {
             "call write_file a.py",
             "done ok=true",
             "step 1",
+            "nudge Verify",
+            "step 2",
             "finished Completed",
         ]
     );
     assert_eq!(judged.lock().expect("judge requests").len(), 1);
+}
+
+#[tokio::test]
+async fn blocked_turn_still_catches_leaked_tool_call_and_failed_check() {
+    let (_guard, ws) = temp_workspace();
+    let (url, _) = mock_server(vec![
+        sse_tool_call(
+            "chk",
+            "run_command",
+            json!({"command": "cargo test --manifest-path missing-Cargo.toml"}),
+        ),
+        sse_tool_call(
+            "report",
+            "report_task",
+            json!({"summary": "Blocked.", "deliverables": [], "blockers": ["Need missing spec"]}),
+        ),
+        sse_text(r#"<tool_call>{"name":"read_file","arguments":{"path":"a.txt"}}</tool_call>"#),
+        sse_text("Stopped with blocker."),
+        sse_text("Still stopped with blocker."),
+    ])
+    .await;
+    let config = test_config(url, ws);
+    let events = run_one_turn_config(config, "fix and check the missing spec").await;
+    assert!(events.iter().any(|event| matches!(
+        event,
+        AgentEvent::HarnessNudge {
+            reason: NudgeReason::LeakedCall,
+            ..
+        }
+    )));
+    assert!(events.iter().any(|event| matches!(
+        event,
+        AgentEvent::HarnessNudge {
+            reason: NudgeReason::Verify,
+            ..
+        }
+    )));
 }
 
 #[tokio::test]

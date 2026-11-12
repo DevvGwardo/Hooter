@@ -537,6 +537,14 @@ impl TurnGuard {
         })
     }
 
+    /// Observed file edits cannot be cleared by a speculative judge verdict
+    /// without current passing verification.
+    pub fn requires_deterministic_verification(&self) -> bool {
+        self.task
+            .as_ref()
+            .is_some_and(|task| task.observed_edits > 0 && !task.has_current_verification())
+    }
+
     /// Marks a finish nudge as sent (each fires at most once per turn).
     pub fn mark_nudged(&mut self, check: FinishCheck) {
         match check {
@@ -571,12 +579,21 @@ impl TurnGuard {
     /// when the JEV judge has ruled on verify/watchdog: a failed last check,
     /// and open plan steps.
     pub fn factual_finish(&mut self) -> Option<(NudgeReason, String)> {
-        if let Some((command, exit_code)) = self.failed_checks.first_key_value()
-            && self.changed_work()
+        if let Some((command, exit_code)) = self
+            .failed_checks
+            .iter()
+            .find(|(command, _)| {
+                !self.task.as_ref().is_some_and(|task| {
+                    task.scope_denials
+                        .iter()
+                        .any(|denial| denial.target == **command)
+                })
+            })
+            .map(|(command, exit_code)| (command.clone(), *exit_code))
             && !self.failed_check_nudged
         {
             self.failed_check_nudged = true;
-            return Some((NudgeReason::Verify, failed_check_nudge(command, *exit_code)));
+            return Some((NudgeReason::Verify, failed_check_nudge(&command, exit_code)));
         }
         if !self.open_plan.is_empty() && !self.plan_nudged {
             self.plan_nudged = true;
@@ -709,6 +726,10 @@ impl TurnGuard {
                 || task.files.iter().any(|file| {
                     matches!(file.state, crate::task::FileState::Present { bytes, .. } if bytes > 0)
                 })
+                || task
+                    .children
+                    .iter()
+                    .any(|child| child.outcome.is_usable_child_report())
         })
     }
 

@@ -102,8 +102,13 @@ async fn adaptive_hints_do_not_cross_scope_read_only_child_or_cancelled_boundari
     session.prepare_improvement_boundary(&cancel);
     assert!(!session.improvement_context().is_empty());
     session.task.as_mut().unwrap().contract.revision += 1;
-    assert!(session.improvement_context().is_empty());
-    session.task.as_mut().unwrap().contract.revision -= 1;
+    assert!(!session.improvement_context().is_empty());
+    let next_task = session.task.as_mut().unwrap();
+    next_task.contract.id += 1;
+    next_task.assessment = None;
+    session.turn_id = 3;
+    session.prepare_improvement_boundary(&cancel);
+    assert!(!session.improvement_context().is_empty());
     session.task.as_mut().unwrap().contract.mode = TaskMode::ReadOnly;
     assert!(session.improvement_context().is_empty());
     session.task.as_mut().unwrap().contract.mode = TaskMode::Work;
@@ -118,7 +123,7 @@ async fn adaptive_hints_do_not_cross_scope_read_only_child_or_cancelled_boundari
         .unwrap()
         .revision;
     cancel.cancel();
-    session.turn_id = 3;
+    session.turn_id = 4;
     session.prepare_improvement_boundary(&cancel);
     assert!(session.improvement_context().is_empty());
     assert_eq!(
@@ -130,6 +135,56 @@ async fn adaptive_hints_do_not_cross_scope_read_only_child_or_cancelled_boundari
             .unwrap()
             .revision,
         before
+    );
+}
+
+#[tokio::test]
+async fn adaptive_session_learns_from_continuation_limit_and_survives_limit_errors() {
+    let (_root, mut session) = saved_session();
+    session.initialize_improvements(true);
+    let mut limited = unverified_task();
+    limited.assessment.as_mut().unwrap().reason = TurnEndReason::ContinuationLimit;
+    limited.continuation_stop = Some(crate::ContinuationStop {
+        cause: crate::ContinuationStopCause::BudgetExhausted,
+        followups: 2,
+        condition: "Run cargo test".into(),
+    });
+    session.task = Some(limited);
+    session.turn_id = 1;
+    let cancel = CancellationToken::new();
+    session.prepare_improvement_boundary(&cancel);
+    session.learn_completed_task(&TurnEndReason::ContinuationLimit);
+    assert_eq!(
+        session
+            .improvements
+            .as_ref()
+            .unwrap()
+            .inspect()
+            .unwrap()
+            .candidates
+            .len(),
+        1
+    );
+
+    // An oversized single task triggers Error::Limit without disabling the store.
+    session.turn_id = 2;
+    let mut oversize = unverified_task();
+    oversize.contract.id = 99;
+    oversize.assessment.as_mut().unwrap().task_id = 99;
+    oversize.report = Some("x".repeat(crate::improvement::MAX_TASK_BYTES));
+    session.task = Some(oversize);
+    session.prepare_improvement_boundary(&cancel);
+    session.learn_completed_task(&TurnEndReason::Completed);
+    assert!(session.improvements.is_some());
+
+    // Previously learned hints still activate on the next turn.
+    session.turn_id = 3;
+    session.task = Some(unverified_task());
+    session.prepare_improvement_boundary(&cancel);
+    assert!(
+        session
+            .improvement_context()
+            .contains(crate::improvement::HintKind::DirectVerificationReminder.prompt_text())
     );
 }
 
