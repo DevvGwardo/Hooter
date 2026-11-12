@@ -365,14 +365,14 @@ pub fn read_conversation_summary(dir: &Path) -> Result<Option<ConversationSummar
             "Unsupported history version.",
         ));
     }
-    let Some(state) = projection.orchestration else {
-        if projection.version == 3 {
-            return Err(EngineError::new(
-                EngineErrorCode::CorruptState,
-                "Missing v3 orchestration.",
-            ));
-        }
+    if projection.version != 3 {
         return Ok(None);
+    }
+    let Some(state) = projection.orchestration else {
+        return Err(EngineError::new(
+            EngineErrorCode::CorruptState,
+            "Missing v3 orchestration.",
+        ));
     };
     store::validate_lineage(&directory, &state)?;
     if let Some(task) = &projection.task {

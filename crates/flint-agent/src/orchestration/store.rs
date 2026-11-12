@@ -4,7 +4,7 @@ use crate::{TaskOutcome, TaskRecord};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 
 pub(crate) const MAX_SNAPSHOT_BYTES: usize = 64 * 1024 * 1024;
@@ -54,6 +54,7 @@ pub(crate) struct Store {
     pub document: Value,
     pub state: State,
     pub limits: EngineLimits,
+    retained_index: HashMap<CommandId, CommandReceipt>,
     poisoned: bool,
     #[cfg(test)]
     pub fault: Option<&'static str>,
@@ -155,6 +156,7 @@ pub(crate) fn read_document(directory: &Directory) -> Result<Option<Value>, Engi
 }
 
 pub(crate) fn validate_state(state: &State) -> Result<(), EngineError> {
+    validate_target(&state.target).map_err(|_| corrupt())?;
     if state.version != 1
         || state.revision == 0
         || state.next_sequence == 0
@@ -361,10 +363,24 @@ impl Store {
             document,
             state: state.clone(),
             limits: options.limits,
+            retained_index: HashMap::new(),
             poisoned: false,
             #[cfg(test)]
             fault: None,
         };
+        if existing {
+            let mut next = state.receipt_head.clone();
+            let mut ordinal = state.receipt_count;
+            while let Some(name) = next {
+                let node = store.node(&name, ordinal)?;
+                store
+                    .retained_index
+                    .entry(node.receipt.id.clone())
+                    .or_insert(node.receipt);
+                next = node.previous;
+                ordinal -= 1;
+            }
+        }
         // read_document already proved membership in the canonical lineage
         // before this owner can create objects or commit recovery. Only active
         // payloads need to be opened here; historical payloads stay on disk.
@@ -376,22 +392,22 @@ impl Store {
             state.revision = state.revision.checked_add(1).ok_or_else(corrupt)?;
         }
         for pending in &mut state.pending {
-            pending.receipt.status_revision = state.revision;
-            pending.receipt.state = match &pending.receipt.state {
+            match &pending.receipt.state {
                 CommandState::Started { run_id, .. } => {
-                    CommandState::Held(HoldReason::AmbiguousEffects {
+                    pending.receipt.status_revision = state.revision;
+                    pending.receipt.state = CommandState::Held(HoldReason::AmbiguousEffects {
                         run_id: run_id.clone(),
                         intent_ids: Vec::new(),
-                    })
+                    });
                 }
-                CommandState::Held(HoldReason::AmbiguousEffects { .. }) => {
-                    pending.receipt.state.clone()
+                CommandState::Accepted | CommandState::Held(HoldReason::Restart { .. }) => {
+                    pending.receipt.status_revision = state.revision;
+                    pending.receipt.state = CommandState::Held(HoldReason::Restart {
+                        generation: state.generation,
+                    });
                 }
-                CommandState::Finished { .. } => pending.receipt.state.clone(),
-                _ => CommandState::Held(HoldReason::Restart {
-                    generation: state.generation,
-                }),
-            };
+                CommandState::Held(_) | CommandState::Finished { .. } => {}
+            }
         }
         store.commit(state)?;
         Ok(store)
@@ -405,8 +421,7 @@ impl Store {
     }
     fn retained(&self, id: &CommandId) -> Result<Option<CommandReceipt>, EngineError> {
         self.healthy()?;
-        // Fast path: active pending entries are already in memory — skip the
-        // on-disk chain walk when the caller retries an active command.
+        // Fast path: active pending entries hold the latest runtime state.
         if let Some(entry) = self
             .state
             .pending
@@ -415,17 +430,7 @@ impl Store {
         {
             return Ok(Some(entry.receipt.clone()));
         }
-        let mut next = self.state.receipt_head.clone();
-        let mut ordinal = self.state.receipt_count;
-        while let Some(name) = next {
-            let node = self.node(&name, ordinal)?;
-            if &node.receipt.id == id {
-                return Ok(Some(node.receipt));
-            }
-            next = node.previous;
-            ordinal -= 1;
-        }
-        Ok(None)
+        Ok(self.retained_index.get(id).cloned())
     }
 
     pub fn receipt(&self, id: &CommandId) -> Result<Option<CommandReceipt>, EngineError> {
@@ -720,6 +725,11 @@ impl Store {
             self.poisoned = true;
             return Err(storage(error));
         }
+        for entry in &state.pending {
+            self.retained_index
+                .entry(entry.receipt.id.clone())
+                .or_insert_with(|| entry.receipt.clone());
+        }
         self.document = document;
         self.state = state;
         Ok(())
@@ -769,12 +779,22 @@ fn validate_limits(limits: &EngineLimits) -> Result<(), EngineError> {
         || limits.queued_bytes > defaults.queued_bytes
         || limits.command_inbox == 0
         || limits.command_inbox > defaults.command_inbox
+        || limits.record_delivery == 0
+        || limits.record_delivery > defaults.record_delivery
+        || limits.progress_keys == 0
+        || limits.progress_keys > defaults.progress_keys
+        || limits.progress_bytes == 0
+        || limits.progress_bytes > defaults.progress_bytes
+        || limits.outbox_bytes == 0
+        || limits.outbox_bytes > defaults.outbox_bytes
+        || limits.active_children == 0
+        || limits.active_children > defaults.active_children
+        || limits.retained_children == 0
+        || limits.retained_children > defaults.retained_children
         || limits.history_page_rows == 0
         || limits.history_page_rows > defaults.history_page_rows
         || limits.history_page_bytes == 0
         || limits.history_page_bytes > defaults.history_page_bytes
-        || limits.record_delivery == 0
-        || limits.record_delivery > defaults.record_delivery
     {
         return Err(EngineError::new(
             EngineErrorCode::InvalidCommand,
@@ -836,6 +856,14 @@ pub(crate) fn summary_from(
         .transpose()
         .map_err(|_| corrupt())?
         .unwrap_or(TaskOutcome::Unknown);
+    let hold = state
+        .pending
+        .iter()
+        .find_map(|entry| match &entry.receipt.state {
+            CommandState::Held(hold) => Some(hold.clone()),
+            _ => None,
+        })
+        .or(Some(HoldReason::Paused));
     Ok(ConversationSummary {
         conversation: ConversationId {
             root: state.root.clone(),
@@ -849,7 +877,7 @@ pub(crate) fn summary_from(
         last_turn_id: document["turn_id"].as_u64().ok_or_else(corrupt)?,
         running: false,
         queued: state.pending.len(),
-        hold: Some(HoldReason::Paused),
+        hold,
         outcome,
         unread: false,
         preview: state

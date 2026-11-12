@@ -14,7 +14,8 @@ use windows_sys::Wdk::Foundation::OBJECT_ATTRIBUTES;
 use windows_sys::Wdk::Storage::FileSystem::*;
 use windows_sys::Win32::Foundation::{
     HANDLE, LocalFree, OBJ_CASE_INSENSITIVE, OBJ_DONT_REPARSE, RtlNtStatusToDosError,
-    UNICODE_STRING,
+    STATUS_INVALID_INFO_CLASS, STATUS_INVALID_PARAMETER, STATUS_NOT_IMPLEMENTED,
+    STATUS_NOT_SUPPORTED, UNICODE_STRING,
 };
 use windows_sys::Win32::Security::Authorization::ConvertStringSecurityDescriptorToSecurityDescriptorW;
 use windows_sys::Win32::Security::{PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES};
@@ -307,7 +308,6 @@ impl Directory {
         ];
         let information = storage.as_mut_ptr().cast::<FILE_RENAME_INFORMATION>();
         unsafe {
-            (*information).Anonymous.ReplaceIfExists = replace;
             (*information).RootDirectory = self.0.as_raw_handle();
             (*information).FileNameLength = (name.len() * 2) as u32;
             std::ptr::copy_nonoverlapping(
@@ -317,6 +317,39 @@ impl Directory {
             );
         }
         let mut status = IO_STATUS_BLOCK::default();
+        if replace {
+            // POSIX-semantics rename allows replacing an existing file even while
+            // read-only callers hold a handle opened with FILE_SHARE_DELETE.
+            unsafe {
+                (*information).Anonymous.Flags =
+                    FILE_RENAME_REPLACE_IF_EXISTS | FILE_RENAME_POSIX_SEMANTICS;
+            }
+            let nt_status = unsafe {
+                NtSetInformationFile(
+                    file.as_raw_handle(),
+                    &mut status,
+                    information.cast(),
+                    length as u32,
+                    FileRenameInformationEx,
+                )
+            };
+            if nt_status >= 0 {
+                return Ok(());
+            }
+            if !matches!(
+                nt_status,
+                STATUS_INVALID_INFO_CLASS
+                    | STATUS_NOT_SUPPORTED
+                    | STATUS_INVALID_PARAMETER
+                    | STATUS_NOT_IMPLEMENTED
+            ) {
+                return nt_result(nt_status);
+            }
+        }
+        unsafe {
+            (*information).Anonymous.Flags = 0;
+            (*information).Anonymous.ReplaceIfExists = replace;
+        }
         nt_result(unsafe {
             NtSetInformationFile(
                 file.as_raw_handle(),
@@ -578,5 +611,63 @@ mod tests {
         for public in [";;;WD)", ";;;BU)", ";;;AU)", ";;;AN)"] {
             assert!(!acl.contains(public), "{acl}");
         }
+    }
+
+    #[test]
+    fn replace_succeeds_while_reader_handle_is_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let directory = Directory::open(dir.path()).unwrap();
+        directory.replace("history.json", b"first").unwrap();
+        let mut reader = directory.reader("history.json", 100).unwrap();
+        directory.replace("history.json", b"second").unwrap();
+        let mut seen = Vec::new();
+        reader.read_to_end(&mut seen).unwrap();
+        assert_eq!(seen, b"first");
+        assert_eq!(directory.read("history.json", 100).unwrap(), b"second");
+    }
+
+    #[test]
+    fn ntfs_directory_junctions_are_refused() {
+        let parent = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("keep"), b"unrelated").unwrap();
+
+        let alias = parent.path().join("alias");
+        let status = std::process::Command::new("cmd")
+            .args([
+                "/C",
+                "mklink",
+                "/J",
+                &alias.to_string_lossy(),
+                &outside.path().to_string_lossy(),
+            ])
+            .status()
+            .unwrap();
+        assert!(status.success(), "mklink /J failed with {status}");
+        assert!(Directory::open(&alias).is_err());
+        assert!(WriterLease::acquire(&alias).is_err());
+        assert!(!outside.path().join(".flint-writer.lock").exists());
+
+        let session = parent.path().join("session");
+        std::fs::create_dir(&session).unwrap();
+        let dir_handle = Directory::open(&session).unwrap();
+        let child_junction = session.join("engine-objects");
+        let status = std::process::Command::new("cmd")
+            .args([
+                "/C",
+                "mklink",
+                "/J",
+                &child_junction.to_string_lossy(),
+                &outside.path().to_string_lossy(),
+            ])
+            .status()
+            .unwrap();
+        assert!(status.success(), "mklink /J failed with {status}");
+        assert!(dir_handle.open_child("engine-objects").is_err());
+        assert!(dir_handle.child("engine-objects").is_err());
+        assert_eq!(
+            std::fs::read(outside.path().join("keep")).unwrap(),
+            b"unrelated"
+        );
     }
 }
