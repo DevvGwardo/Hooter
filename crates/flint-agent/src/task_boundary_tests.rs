@@ -546,22 +546,20 @@ async fn unchanged_read_steps_do_not_emit_duplicate_task_projections() {
 #[tokio::test]
 async fn mutations_with_test_named_operands_still_invalidate_earlier_native_checks() {
     let (_root, ws) = temp_workspace();
+    let check = exists_check(&ws, "result.txt");
+    let mutate = if cfg!(windows) {
+        r#"powershell.exe -NoProfile -NonInteractive -Command "Set-Content validation_test_artefact created""#
+    } else {
+        "touch validation_test_artefact"
+    };
     let (url, _) = mock_server(vec![
         sse_tool_call(
             "write",
             "write_file",
             json!({"path":"result.txt","content":"result"}),
         ),
-        sse_tool_call(
-            "check",
-            "run_command",
-            json!({"command":"test -f result.txt"}),
-        ),
-        sse_tool_call(
-            "mutate",
-            "run_command",
-            json!({"command":"touch validation_test_artefact"}),
-        ),
+        sse_tool_call("check", "run_command", json!({"command":check})),
+        sse_tool_call("mutate", "run_command", json!({"command":mutate})),
         sse_text("Done."),
         sse_text("Partial: the earlier check is stale."),
     ])
@@ -569,7 +567,7 @@ async fn mutations_with_test_named_operands_still_invalidate_earlier_native_chec
     let events = run_one_turn(
         url,
         ws.clone(),
-        "Produce result.txt.\nRequired file: result.txt\nRequired check: test -f result.txt",
+        &format!("Produce result.txt.\nRequired file: result.txt\nRequired check: {check}"),
     )
     .await;
     let task = assessed(&events);
@@ -702,6 +700,7 @@ async fn imperative_do_request_cannot_finish_as_an_answer_without_work() {
 #[tokio::test]
 async fn steering_work_into_a_question_preserves_new_required_deliverables() {
     let (_root, ws) = temp_workspace();
+    let check = exists_check(&ws, "result.txt");
     let (url, _) = mock_server(vec![sse_text("The parser reads tokens.")]).await;
     let handle = crate::spawn_session(test_config(url, ws));
     handle
@@ -713,8 +712,9 @@ async fn steering_work_into_a_question_preserves_new_required_deliverables() {
         .ops
         .send(Op::SteerMessage {
             id: 41,
-            text: "Implement the parser fix.\nRequired file: result.txt\nRequired check: test -s result.txt"
-                .into(),
+            text: format!(
+                "Implement the parser fix.\nRequired file: result.txt\nRequired check: {check}"
+            ),
             images: Vec::new(),
         })
         .await
@@ -734,9 +734,12 @@ async fn steering_work_into_a_question_preserves_new_required_deliverables() {
             .iter()
             .any(|requirement| requirement.spec == RequirementSpec::File("result.txt".into()))
     );
-    assert!(task.contract.requirements.iter().any(
-        |requirement| requirement.spec == RequirementSpec::Command("test -s result.txt".into())
-    ));
+    assert!(
+        task.contract
+            .requirements
+            .iter()
+            .any(|requirement| requirement.spec == RequirementSpec::Command(check.clone()))
+    );
     assert_eq!(
         task.assessment.as_ref().unwrap().outcome,
         TaskOutcome::Partial
@@ -777,17 +780,27 @@ async fn a_new_failed_turn_does_not_inherit_the_previous_final_answer_blocker() 
 #[tokio::test]
 async fn an_exact_required_make_check_is_not_stale_from_its_own_execution() {
     let (_root, ws) = temp_workspace();
-    std::fs::write(
-        ws.join("Makefile"),
-        ".PHONY: test\ntest:\n\t@printf 'checked\\n'\n",
-    )
-    .unwrap();
+    let command = if cfg!(windows) {
+        r#"powershell.exe -NoProfile -NonInteractive -Command "Write-Output checked""#
+    } else {
+        std::fs::write(
+            ws.join("Makefile"),
+            ".PHONY: test\ntest:\n\t@printf 'checked\\n'\n",
+        )
+        .unwrap();
+        "make test"
+    };
     let (url, _) = mock_server(vec![
-        sse_tool_call("check", "run_command", json!({"command":"make test"})),
+        sse_tool_call("check", "run_command", json!({"command":command})),
         sse_text("The requested check passed. Review the result."),
     ])
     .await;
-    let events = run_one_turn(url, ws, "Run the checks.\nRequired check: make test").await;
+    let events = run_one_turn(
+        url,
+        ws,
+        &format!("Run the checks.\nRequired check: {command}"),
+    )
+    .await;
     let task = assessed(&events);
     let check = task
         .checks

@@ -4,10 +4,6 @@ use super::*;
 use crate::task::*;
 use pretty_assertions::assert_eq;
 #[path = "adaptive_session_tests.rs"]
-// ImprovementStore::open refuses non-Unix by contract (ownership/mode/link
-// checks have no validated Windows equivalent), so these tests can only run
-// where the lane initializes.
-#[cfg(unix)]
 mod adaptive_session_tests;
 #[path = "analysis_flow_tests.rs"]
 mod analysis_flow_tests;
@@ -34,10 +30,10 @@ fn assessed(events: &[AgentEvent]) -> &TaskRecord {
 }
 
 /// `workspace` is only needed on Windows, where the script must be materialized.
-fn exists_check(_workspace: &std::path::Path, path: &str) -> String {
+pub(super) fn exists_check(_workspace: &std::path::Path, path: &str) -> String {
     if cfg!(windows) {
-        // The classifier blesses `python test_*.py` as a non-mutating check
-        // while inline `python -c` stays conservatively mutating (it can hide
+        // The classifier blesses `py test_*.py` as a non-mutating check
+        // while inline `py -c` stays conservatively mutating (it can hide
         // arbitrary writes). Emit the script form so Windows turns observe
         // the same clean effects as Unix `test -s`.
         std::fs::write(
@@ -47,7 +43,7 @@ fn exists_check(_workspace: &std::path::Path, path: &str) -> String {
              assert path.is_file() and path.stat().st_size > 0, path\n",
         )
         .expect("check script");
-        format!("python test_check_exists.py {path}")
+        format!("py test_check_exists.py {path}")
     } else {
         format!("test -s {path}")
     }
@@ -160,6 +156,7 @@ async fn jev_updates_apply_between_turns_without_changing_edit_approvals() {
             json!({"path":"first.txt","content":"first"}),
         ),
         sse_text("First written."),
+        sse_text("First still needs verification."),
         sse_tool_call(
             "second",
             "write_file",
@@ -173,6 +170,7 @@ async fn jev_updates_apply_between_turns_without_changing_edit_approvals() {
             json!({"path":"third.txt","content":"third"}),
         ),
         sse_text("Third written."),
+        sse_text("Third still needs verification."),
     ])
     .await;
     let (judge_url, judged) = mock_judge(0.9).await;
@@ -400,7 +398,7 @@ async fn passing_format_check_preserves_verification_and_skips_unnecessary_jev()
 async fn failed_verification_uses_its_observed_exit_code_not_a_jev_opinion() {
     let (_root, ws) = temp_workspace();
     let command = if cfg!(windows) {
-        r#"python -c "assert False""#
+        r#"py -c "assert False""#
     } else {
         "test -s missing-result"
     };
@@ -641,7 +639,7 @@ async fn unverified_write_stops_normally_but_remains_partial_after_the_nudge() {
 async fn actual_metadata_validator_cannot_cover_the_missing_method_body_deliverable() {
     let (_root, ws) = temp_workspace();
     let command = if cfg!(windows) {
-        r#"python -c "import json; assert json.load(open('metadata.json'))['classes'] == ['Demo']""#
+        r#"py -c "import json; assert json.load(open('metadata.json'))['classes'] == ['Demo']""#
     } else {
         r#"python3 -c 'import json; assert json.load(open("metadata.json"))["classes"] == ["Demo"]'"#
     };
@@ -908,17 +906,14 @@ async fn normal_conversational_answer_has_no_edit_or_forced_continuation() {
 async fn accepted_native_result_is_durable_before_its_ack_and_undo_invalidates_it() {
     let (_root, ws) = temp_workspace();
     let saved = tempfile::tempdir().unwrap();
+    let check = exists_check(&ws, "result.txt");
     let (url, _) = mock_server(vec![
         sse_tool_call(
             "write",
             "write_file",
             json!({"path":"result.txt", "content":"output"}),
         ),
-        sse_tool_call(
-            "check",
-            "run_command",
-            json!({"command":"test -s result.txt"}),
-        ),
+        sse_tool_call("check", "run_command", json!({"command":check})),
         sse_text("The output is ready for review."),
     ])
     .await;
@@ -927,10 +922,9 @@ async fn accepted_native_result_is_durable_before_its_ack_and_undo_invalidates_i
     let handle = crate::spawn_session(config);
     handle
         .ops
-        .send(Op::UserMessage(
-            "Produce the output.\nRequired file: result.txt\nRequired check: test -s result.txt"
-                .into(),
-        ))
+        .send(Op::UserMessage(format!(
+            "Produce the output.\nRequired file: result.txt\nRequired check: {check}"
+        )))
         .await
         .unwrap();
     let mut events = Vec::new();
@@ -1262,5 +1256,233 @@ async fn a_write_and_its_check_in_one_step_keep_the_check_current() {
         check.state(task.contract.revision, task.work_revision),
         EvidenceState::Passed,
         "a check that ran after the write in the same step must stay current"
+    );
+}
+
+#[test]
+fn stale_blocked_automatic_review_does_not_lock_task_across_repairs() {
+    let (_root, ws) = temp_workspace();
+    std::fs::write(ws.join("result.txt"), "draft").unwrap();
+    let check_cmd = exists_check(&ws, "result.txt");
+    let mut task = TaskRecord::new(1, "Create and verify result.txt.".into(), 1);
+    task.observed_edits = 1;
+    task.note_file("result.txt", true);
+    task.refresh_files(&ws);
+    task.checks.push(CommandEvidence {
+        id: 1,
+        call_id: "check-1".into(),
+        command: check_cmd.clone(),
+        contract_revision: 1,
+        work_revision: 1,
+        started_revision: 1,
+        success: true,
+        exit_code: Some(0),
+        detail: "passed".into(),
+        verification: true,
+    });
+    task.assess(TurnEndReason::Completed, true);
+    task.record_automatic_review(AutomaticReview {
+        contract_revision: 1,
+        work_revision: 1,
+        model: "fixture".into(),
+        verdict: AutomaticReviewVerdict::Blocked,
+        summary: "Missing required semantics.".into(),
+        findings: vec!["Result content is incomplete.".into()],
+        reviewed_requirements: vec![1],
+        inspected_files: task.files.clone(),
+    })
+    .unwrap();
+    assert_eq!(
+        task.assessment.as_ref().unwrap().outcome,
+        TaskOutcome::Blocked
+    );
+    assert!(
+        task.assessment
+            .as_ref()
+            .unwrap()
+            .issues
+            .iter()
+            .any(|issue| issue.contains("Automatic review: Result content is incomplete."))
+    );
+    assert!(!task.can_automatically_review());
+
+    // After the builder repairs the file and passes verification at a new work
+    // revision, the stale Blocked review must degrade cleanly instead of
+    // permanently locking TaskOutcome::Blocked.
+    std::fs::write(ws.join("result.txt"), "fixed").unwrap();
+    task.set_work_revision(2);
+    task.observed_edits = 2;
+    task.refresh_files(&ws);
+    task.checks.push(CommandEvidence {
+        id: 2,
+        call_id: "check-2".into(),
+        command: check_cmd,
+        contract_revision: 1,
+        work_revision: 2,
+        started_revision: 2,
+        success: true,
+        exit_code: Some(0),
+        detail: "passed".into(),
+        verification: true,
+    });
+    let repaired = task.assess(TurnEndReason::Completed, true);
+    assert_eq!(repaired.outcome, TaskOutcome::NeedsReview);
+    assert!(repaired.issues.is_empty(), "{:?}", repaired.issues);
+    assert!(task.can_automatically_review());
+    assert!(!task.is_automatically_verified());
+    assert!(
+        task.context()
+            .contains("[Independent automatic review feedback]")
+    );
+    assert!(task.context().contains("Result content is incomplete."));
+}
+
+#[tokio::test]
+async fn failed_automatic_review_does_not_pollute_builder_history_or_return_completed() {
+    let (_root, ws) = temp_workspace();
+    let check = exists_check(&ws, "result.txt");
+    let ws_for_hook = ws.clone();
+    // Request 0..=2: initial builder turn; Request 3: reviewer inspects;
+    // Request 4: reviewer returns clean verdict after out-of-band drift;
+    // Request 5: subsequent builder turn to verify history stays clean.
+    let (url, requests) = mock_server_with_response_hook(
+        vec![
+            sse_tool_call(
+                "write",
+                "write_file",
+                json!({"path":"result.txt","content":"result"}),
+            ),
+            sse_tool_call("check", "run_command", json!({"command":check})),
+            sse_text("Ready for review."),
+            sse_tool_call("inspect", "read_file", json!({"path":"result.txt"})),
+            sse_tool_call(
+                "review-verdict",
+                "finish_review",
+                json!({
+                    "verdict": "clean",
+                    "summary": "Looks good.",
+                    "findings": [],
+                    "reviewed_requirements": [1],
+                }),
+            ),
+            sse_text("Builder continuing cleanly."),
+        ],
+        json!({"data": [{"id": "test-model", "context_length": 128000}]}),
+        move |index| {
+            // Mutate result.txt right before the reviewer's final verdict
+            // response so automatic_review finishes but refresh_task_files()
+            // detects drift and makes record_automatic_review return Err.
+            if index == 4 {
+                std::fs::write(ws_for_hook.join("result.txt"), "drifted").unwrap();
+            }
+        },
+    )
+    .await;
+    let handle = crate::spawn_session(test_config(url, ws));
+    handle
+        .ops
+        .send(Op::UserMessage("Create and verify result.txt.".into()))
+        .await
+        .unwrap();
+    let mut first = Vec::new();
+    collect_turn(&handle, &mut first).await;
+    let ready = assessed(&first).clone();
+    assert!(ready.can_automatically_review());
+
+    handle
+        .ops
+        .send(Op::AutomaticallyReviewTask {
+            task_id: ready.contract.id,
+            expected_revision: ready.contract.revision,
+            expected_work_revision: ready.work_revision,
+        })
+        .await
+        .unwrap();
+    let mut review_events = Vec::new();
+    collect_turn(&handle, &mut review_events).await;
+    let review_reason = review_events
+        .iter()
+        .find_map(|event| match event {
+            AgentEvent::TurnFinished { reason, .. } => Some(reason.clone()),
+            _ => None,
+        })
+        .expect("review TurnFinished");
+    assert!(
+        matches!(review_reason, TurnEndReason::Failed(_)),
+        "expected Failed review reason, got {review_reason:?}"
+    );
+    let reviewed = assessed(&review_events);
+    assert_eq!(
+        reviewed.assessment.as_ref().unwrap().outcome,
+        TaskOutcome::Partial
+    );
+    assert!(!reviewed.can_automatically_review());
+    assert!(
+        !review_events
+            .iter()
+            .any(|event| matches!(event, AgentEvent::TextDelta(_))),
+        "failed review must not stream an assistant summary delta"
+    );
+
+    handle
+        .ops
+        .send(Op::UserMessage("Follow up.".into()))
+        .await
+        .unwrap();
+    let mut followup = Vec::new();
+    collect_turn(&handle, &mut followup).await;
+    let last_request = requests.lock().unwrap().last().unwrap().clone();
+    let messages_json = last_request["messages"].to_string();
+    assert!(
+        !messages_json.contains("Evidence changed before review"),
+        "failed review error leaked into builder history: {messages_json}"
+    );
+
+    handle.ops.send(Op::Shutdown).await.unwrap();
+    while let Ok(Ok(event)) =
+        tokio::time::timeout(Duration::from_secs(3), handle.events.recv()).await
+    {
+        if matches!(event, AgentEvent::SessionStopped { .. }) {
+            break;
+        }
+    }
+}
+
+#[tokio::test]
+async fn mutating_verification_command_does_not_grant_current_post_mutation_verification() {
+    let (_root, ws) = temp_workspace();
+    let command = if cfg!(windows) {
+        r#"py -c "import pathlib; pathlib.Path('result.txt').write_text('mutated'); assert True""#
+    } else {
+        r#"python3 -c "import pathlib; pathlib.Path('result.txt').write_text('mutated'); assert True""#
+    };
+    let (url, _) = mock_server(vec![
+        sse_tool_call(
+            "write",
+            "write_file",
+            json!({"path":"result.txt","content":"initial"}),
+        ),
+        sse_tool_call("check", "run_command", json!({"command":command})),
+        sse_text("Done."),
+        sse_text("Still unverified after mutating command."),
+    ])
+    .await;
+    let events = run_one_turn(url, ws, "Create and verify result.txt.").await;
+    let task = assessed(&events);
+    let check = task
+        .checks
+        .iter()
+        .find(|check| check.call_id == "check")
+        .expect("mutating verification check recorded");
+    assert_eq!(check.exit_code, Some(0));
+    assert_eq!(
+        check.state(task.contract.revision, task.work_revision),
+        EvidenceState::Stale,
+        "an unrequested mutating verification command must stay Stale"
+    );
+    assert!(!task.has_current_verification());
+    assert_eq!(
+        task.assessment.as_ref().unwrap().outcome,
+        TaskOutcome::Partial
     );
 }

@@ -284,8 +284,8 @@ impl Subagents {
         let tools = if worktree.is_some() {
             let mut tools = ToolContext::new(config.workspace.clone(), config.sandbox);
             // Scope restrictions still propagate immediately across the family,
-            // but this checkout has its own confined file/undo journal.
-            tools.work_clock = self.tools.work_clock.clone();
+            // while this checkout has its own isolated mutation revision epoch.
+            tools.work_clock = Arc::new(self.tools.work_clock.fork_isolated());
             tools
         } else {
             self.tools.child()

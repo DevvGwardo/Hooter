@@ -89,11 +89,21 @@ fn outcome(events: &[AgentEvent], id: &str) -> (String, bool) {
         .unwrap()
 }
 
+fn worktree_exists_check(workspace: &std::path::Path, path: &str) -> String {
+    let check = task_engine_tests::exists_check(workspace, path);
+    if cfg!(windows) {
+        crate::worktree::tests::run(workspace, &["add", "test_check_exists.py"]);
+        crate::worktree::tests::run(workspace, &["commit", "-m", "add check helper"]);
+    }
+    check
+}
+
 #[tokio::test]
 async fn worktree_child_uses_real_file_and_command_workspace_and_resumes_after_restart() {
     let (temp, repo, checkout) = fixture().await;
     let parent = temp.path().join("general");
     std::fs::create_dir(&parent).unwrap();
+    let check = worktree_exists_check(&checkout.workspace, "generated.txt");
     let (url, requests) = mock_server(vec![
         sse_tool_call(
             "delegate",
@@ -108,11 +118,7 @@ async fn worktree_child_uses_real_file_and_command_workspace_and_resumes_after_r
             "write_file",
             json!({"path":"generated.txt", "content":"child output\n"}),
         ),
-        sse_tool_call(
-            "check",
-            "run_command",
-            json!({"command":"test -f generated.txt"}),
-        ),
+        sse_tool_call("check", "run_command", json!({"command":check})),
         sse_text("Created and checked generated.txt."),
         sse_text("The result is in the isolated checkout."),
     ])
@@ -274,4 +280,149 @@ async fn two_children_cannot_run_in_the_same_worktree_and_resume_cannot_change_i
             .unwrap()
             .contains("cannot be changed")
     );
+}
+
+#[test]
+fn isolated_work_clock_decouples_mutations_from_parent_while_sharing_read_only_scope() {
+    let parent = crate::task::WorkClock::default();
+    let child = parent.fork_isolated();
+    assert_eq!(child.advance(), 1);
+    assert_eq!(parent.revision(), 0);
+    assert!(!child.read_only());
+    parent.set_read_only(true);
+    assert!(child.read_only());
+}
+
+#[tokio::test]
+async fn worktree_child_edits_preserve_parent_checks_and_satisfy_delegated_verification() {
+    let (temp, repo, checkout) = fixture().await;
+    let parent = temp.path().join("general");
+    std::fs::create_dir(&parent).unwrap();
+    let parent_check = task_engine_tests::exists_check(&parent, "parent.txt");
+    let child_check = worktree_exists_check(&checkout.workspace, "generated.txt");
+    let (url, _) = mock_server(vec![
+        sse_tool_call(
+            "parent-write",
+            "write_file",
+            json!({"path":"parent.txt", "content":"parent\n"}),
+        ),
+        sse_tool_call(
+            "parent-check",
+            "run_command",
+            json!({"command":parent_check}),
+        ),
+        sse_tool_call(
+            "delegate",
+            "spawn_agent",
+            json!({
+                "label":"Worktree task", "message":"Create generated.txt and verify it exists.",
+                "worktree":{"repository":repo, "branch":"agent-task"}
+            }),
+        ),
+        sse_tool_call(
+            "child-write",
+            "write_file",
+            json!({"path":"generated.txt", "content":"child output\n"}),
+        ),
+        sse_tool_call("child-check", "run_command", json!({"command":child_check})),
+        sse_text("Created and checked generated.txt."),
+        sse_text("Parent and child work completed."),
+    ])
+    .await;
+    let mut config = test_config(url, parent.clone());
+    config.general = true;
+    config.sandbox = true;
+    let events = approved_turn(
+        config,
+        "Create parent.txt, verify it, and create generated.txt in the repository's agent-task worktree.",
+        ApprovalDecision::Approve,
+    )
+    .await;
+    let task = events
+        .iter()
+        .rev()
+        .find_map(|event| match event {
+            AgentEvent::TaskAssessed { task, .. } => Some(task.as_ref()),
+            _ => None,
+        })
+        .expect("assessed task");
+    let recorded_parent_check = task
+        .checks
+        .iter()
+        .find(|check| check.call_id == "parent-check")
+        .expect("parent check");
+    assert_eq!(
+        recorded_parent_check.state(task.contract.revision, task.work_revision),
+        crate::EvidenceState::Passed,
+        "worktree child mutations must not invalidate earlier parent checks"
+    );
+    assert!(task.has_current_verification());
+    assert!(task.verified_for_queue());
+    assert!(
+        task.children
+            .iter()
+            .any(|child| child.worktree && child.verified)
+    );
+}
+
+#[tokio::test]
+async fn verified_worktree_child_satisfies_parent_verification_when_no_parent_edits_occur() {
+    let (temp, repo, checkout) = fixture().await;
+    let parent = temp.path().join("general");
+    std::fs::create_dir(&parent).unwrap();
+    let child_check = worktree_exists_check(&checkout.workspace, "generated.txt");
+    let (url, _) = mock_server(vec![
+        sse_tool_call(
+            "delegate",
+            "spawn_agent",
+            json!({
+                "label":"Worktree task", "message":"Create generated.txt and verify it exists.",
+                "worktree":{"repository":repo, "branch":"agent-task"}
+            }),
+        ),
+        sse_tool_call(
+            "child-write",
+            "write_file",
+            json!({"path":"generated.txt", "content":"child output\n"}),
+        ),
+        sse_tool_call("child-check", "run_command", json!({"command":child_check})),
+        sse_text("Created and verified generated.txt."),
+        sse_text("Delegated worktree task completed and verified."),
+    ])
+    .await;
+    let mut config = test_config(url, parent);
+    config.general = true;
+    config.sandbox = true;
+    let events = approved_turn(
+        config,
+        "Create generated.txt in the repository's agent-task worktree.",
+        ApprovalDecision::Approve,
+    )
+    .await;
+    let mut task = events
+        .iter()
+        .rev()
+        .find_map(|event| match event {
+            AgentEvent::TaskAssessed { task, .. } => Some(task.as_ref().clone()),
+            _ => None,
+        })
+        .expect("assessed task");
+    assert_eq!(task.observed_edits, 0);
+    assert!(task.has_current_verification());
+    assert!(task.verified_for_queue());
+    assert_eq!(
+        task.assessment.as_ref().unwrap().outcome,
+        crate::TaskOutcome::NeedsReview
+    );
+    assert!(!task.can_automatically_review());
+    assert!(task.children[0].worktree && task.children[0].verified);
+
+    // Subsequent unverified edits in the parent workspace must invalidate
+    // delegated-only verification.
+    task.observed_edits += 1;
+    task.set_work_revision(task.work_revision + 1);
+    let after_edit = task.assess(TurnEndReason::Completed, true);
+    assert!(!task.has_current_verification());
+    assert!(!task.verified_for_queue());
+    assert_eq!(after_edit.outcome, crate::TaskOutcome::Partial);
 }

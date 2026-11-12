@@ -7,6 +7,7 @@
 use std::collections::BTreeSet;
 use std::io::Read as _;
 use std::path::Path;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use serde::{Deserialize, Serialize};
@@ -413,6 +414,12 @@ pub struct ChildAssessment {
     pub outcome: TaskOutcome,
     pub work_revision: u64,
     pub issues: Vec<String>,
+    #[serde(default)]
+    pub worktree: bool,
+    #[serde(default)]
+    pub verified: bool,
+    #[serde(default)]
+    pub parent_work_revision: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -555,7 +562,7 @@ impl TaskRecord {
             && !self.unknown_effects
             && self.continuation_stop.is_none()
             && !self.plan.iter().any(|step| step.status.is_open())
-            && self.has_current_verification()
+            && self.has_own_current_verification()
             && self.assessment.as_ref().is_some_and(|assessment| {
                 assessment.task_id == self.contract.id
                     && assessment.contract_revision == self.contract.revision
@@ -660,12 +667,34 @@ impl TaskRecord {
         Ok(())
     }
 
-    /// Passing execution evidence, not semantic certification or user acceptance.
-    pub fn has_current_verification(&self) -> bool {
+    /// Passing execution evidence in the parent's workspace, not semantic
+    /// certification or user acceptance.
+    pub fn has_own_current_verification(&self) -> bool {
         self.checks.iter().any(|check| {
             check.verification
                 && check.state(self.contract.revision, self.work_revision) == EvidenceState::Passed
         })
+    }
+
+    pub(crate) fn has_verified_worktree_child(&self) -> bool {
+        self.observed_edits == 0
+            && !self
+                .checks
+                .iter()
+                .any(|check| self.failed_verification_is_unresolved(check))
+            && !self.children.is_empty()
+            && self
+                .children
+                .iter()
+                .all(|child| child.outcome.is_usable_child_report() && child.issues.is_empty())
+            && self.children.iter().any(|child| {
+                child.worktree && child.verified && child.parent_work_revision == self.work_revision
+            })
+    }
+
+    /// Passing execution evidence, not semantic certification or user acceptance.
+    pub fn has_current_verification(&self) -> bool {
+        self.has_own_current_verification() || self.has_verified_worktree_child()
     }
 
     pub(crate) fn failed_verification_is_unresolved(&self, check: &CommandEvidence) -> bool {
@@ -1483,6 +1512,7 @@ impl TaskRecord {
         self.evidence_overflow |= child.evidence_overflow;
     }
 
+    #[cfg(test)]
     pub(crate) fn note_child(&mut self, session_id: &str, assessment: &TaskAssessment) {
         let child = ChildAssessment {
             session_id: session_id.into(),
@@ -1490,11 +1520,53 @@ impl TaskRecord {
             outcome: assessment.outcome,
             work_revision: assessment.work_revision,
             issues: assessment.issues.iter().take(16).cloned().collect(),
+            worktree: false,
+            verified: false,
+            parent_work_revision: self.work_revision,
         };
+        self.record_child_assessment(child);
+    }
+
+    pub(crate) fn note_child_report(
+        &mut self,
+        session_id: &str,
+        child_task: &TaskRecord,
+        worktree: bool,
+    ) {
+        let Some(assessment) = &child_task.assessment else {
+            return;
+        };
+        let verified = worktree
+            && assessment.reason == TurnEndReason::Completed
+            && assessment.outcome.is_usable_child_report()
+            && assessment.outcome != TaskOutcome::Answered
+            && assessment.issues.is_empty()
+            && child_task.blockers.is_empty()
+            && !child_task.evidence_overflow
+            && !child_task.plan.iter().any(|step| step.status.is_open())
+            && !child_task
+                .checks
+                .iter()
+                .any(|check| child_task.failed_verification_is_unresolved(check))
+            && child_task.has_current_verification();
+        let child = ChildAssessment {
+            session_id: session_id.into(),
+            task_id: assessment.task_id,
+            outcome: assessment.outcome,
+            work_revision: assessment.work_revision,
+            issues: assessment.issues.iter().take(16).cloned().collect(),
+            worktree,
+            verified,
+            parent_work_revision: self.work_revision,
+        };
+        self.record_child_assessment(child);
+    }
+
+    fn record_child_assessment(&mut self, child: ChildAssessment) {
         if let Some(existing) = self
             .children
             .iter_mut()
-            .find(|child| child.session_id == session_id)
+            .find(|existing| existing.session_id == child.session_id)
         {
             *existing = child;
         } else if self.children.len() < 32 {
@@ -1666,7 +1738,12 @@ impl TaskRecord {
         if self.evidence_overflow {
             issues.push("The observation limit was reached; some evidence is unknown.".into());
         }
-        if let Some(review) = &self.automatic_review
+        let review_current = self.automatic_review.as_ref().is_some_and(|review| {
+            review.contract_revision == self.contract.revision
+                && review.work_revision == self.work_revision
+        });
+        if review_current
+            && let Some(review) = &self.automatic_review
             && review.verdict != AutomaticReviewVerdict::Clean
         {
             issues.extend(
@@ -1679,10 +1756,11 @@ impl TaskRecord {
         let outcome = if self.is_accepted() {
             TaskOutcome::Accepted
         } else if !self.blockers.is_empty()
-            || self
-                .automatic_review
-                .as_ref()
-                .is_some_and(|review| review.verdict == AutomaticReviewVerdict::Blocked)
+            || (review_current
+                && self
+                    .automatic_review
+                    .as_ref()
+                    .is_some_and(|review| review.verdict == AutomaticReviewVerdict::Blocked))
         {
             TaskOutcome::Blocked
         } else if !issues.is_empty() {
@@ -1696,7 +1774,11 @@ impl TaskRecord {
             && self.contract.requirements.len() == 1
         {
             TaskOutcome::Answered
-        } else if !answered && self.checks.is_empty() && self.files.is_empty() {
+        } else if !answered
+            && self.checks.is_empty()
+            && self.files.is_empty()
+            && !self.has_verified_worktree_child()
+        {
             TaskOutcome::Unknown
         } else {
             TaskOutcome::NeedsReview
@@ -1773,14 +1855,21 @@ pub(crate) fn is_continue_request(text: &str) -> bool {
     )
 }
 
-/// Shared by the parent and children. A result spanning another child's edit
-/// is stale even when the child returns its report later.
+#[derive(Debug, Default)]
+struct ScopeFlag {
+    read_only: AtomicBool,
+    pending_read_only: AtomicU64,
+}
+
+/// Shared by the parent and in-workspace children. A result spanning another
+/// child's edit is stale even when the child returns its report later.
+/// Worktree children fork an isolated revision/order clock while sharing only
+/// the read-only scope restriction flag.
 #[derive(Debug, Default)]
 pub(crate) struct WorkClock {
     revision: AtomicU64,
     order: AtomicU64,
-    read_only: AtomicBool,
-    pending_read_only: AtomicU64,
+    scope: Arc<ScopeFlag>,
 }
 
 pub(crate) struct CommandTiming {
@@ -1790,24 +1879,34 @@ pub(crate) struct CommandTiming {
 }
 
 impl WorkClock {
+    pub fn fork_isolated(&self) -> Self {
+        Self {
+            revision: AtomicU64::new(0),
+            order: AtomicU64::new(0),
+            scope: Arc::clone(&self.scope),
+        }
+    }
+
     pub fn read_only(&self) -> bool {
-        self.read_only.load(Ordering::SeqCst) || self.pending_read_only.load(Ordering::SeqCst) > 0
+        self.scope.read_only.load(Ordering::SeqCst)
+            || self.scope.pending_read_only.load(Ordering::SeqCst) > 0
     }
 
     pub fn set_read_only(&self, read_only: bool) {
-        self.read_only.store(read_only, Ordering::SeqCst);
+        self.scope.read_only.store(read_only, Ordering::SeqCst);
     }
     /// Inbox restrictions apply immediately, even behind a deferred control.
     /// Starting another scope cannot clear them before they are consumed.
     pub fn queue_restriction(&self, request: &str) {
         if requests_read_only(request) {
-            self.pending_read_only.fetch_add(1, Ordering::SeqCst);
+            self.scope.pending_read_only.fetch_add(1, Ordering::SeqCst);
         }
     }
     pub fn consume_restriction(&self, request: &str) {
         if requests_read_only(request) {
             self.set_read_only(true);
-            self.pending_read_only
+            self.scope
+                .pending_read_only
                 .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |count| {
                     Some(count.saturating_sub(1))
                 })

@@ -563,6 +563,7 @@ impl Session {
         let mut reason = TurnEndReason::Completed;
         let mut summary =
             "Evidence changed before review. Current verification must be rerun.".to_string();
+        let mut review_recorded = false;
         if let Some(task) = self
             .task
             .clone()
@@ -585,22 +586,27 @@ impl Session {
             }
             match result {
                 Ok(review) if !cancel.is_cancelled() => {
-                    summary = format!(
-                        "Independent automatic review: {}\n{}",
-                        match review.verdict {
-                            crate::task::AutomaticReviewVerdict::Clean =>
-                                "no actionable issues found.",
-                            crate::task::AutomaticReviewVerdict::NeedsFixes => "fixes required.",
-                            crate::task::AutomaticReviewVerdict::Blocked =>
-                                "blocked on missing evidence or access.",
-                        },
-                        review.summary
-                    );
+                    let verdict_label = match review.verdict {
+                        crate::task::AutomaticReviewVerdict::Clean => "no actionable issues found.",
+                        crate::task::AutomaticReviewVerdict::NeedsFixes => "fixes required.",
+                        crate::task::AutomaticReviewVerdict::Blocked => {
+                            "blocked on missing evidence or access."
+                        }
+                    };
+                    let review_summary = review.summary.clone();
                     if let Some(task) = &mut self.task
                         && let Err(error) = task.record_automatic_review(review)
                     {
-                        // Drift is a repairable verification condition, not proof of completion.
+                        // Drift or invalid/unrecordable review must fail this review
+                        // turn cleanly rather than returning Completed with None and
+                        // causing auto_continue to loop on automatic review.
+                        reason = TurnEndReason::Failed(error.clone());
                         summary = error;
+                    } else {
+                        summary = format!(
+                            "Independent automatic review: {verdict_label}\n{review_summary}"
+                        );
+                        review_recorded = true;
                     }
                 }
                 Ok(_) | Err(ProviderError::Cancelled) => reason = TurnEndReason::Interrupted,
@@ -609,6 +615,8 @@ impl Session {
                     summary = format!("Independent automatic review stopped: {error}");
                 }
             }
+        } else if !cancel.is_cancelled() {
+            reason = TurnEndReason::Failed(summary.clone());
         }
         if cancel.is_cancelled() {
             reason = TurnEndReason::Interrupted;
@@ -616,12 +624,16 @@ impl Session {
         if let Some(task) = &mut self.task {
             task.assess(reason.clone(), true);
         }
-        self.emit(AgentEvent::TextDelta(summary.clone()));
-        self.history.push(Message::Assistant {
-            content: summary,
-            reasoning: String::new(),
-            tool_calls: Vec::new(),
-        });
+        if review_recorded && !cancel.is_cancelled() {
+            self.emit(AgentEvent::TextDelta(summary.clone()));
+            self.history.push(Message::Assistant {
+                content: summary,
+                reasoning: String::new(),
+                tool_calls: Vec::new(),
+            });
+        } else if matches!(reason, TurnEndReason::Failed(_)) {
+            self.emit(AgentEvent::Error(summary));
+        }
         self.update_task_context();
         self.save();
         if !self.checkpoint_task().await {
@@ -1775,11 +1787,25 @@ impl Session {
             .remove(&call_id)
             .unwrap_or((self.tools.work_clock.revision(), false));
         if mutates && execution_attempted {
-            // Own completion invalidates older checks, not the check that
-            // just ran. Any intervening sibling epoch still makes it stale.
+            // Own completion invalidates older checks, not a check that was
+            // explicitly required (e.g. `Required check: make test`), as long
+            // as no sibling epoch intervened. Never promote arbitrary mutating
+            // verification commands to current post-mutation verification.
             let before_finish = self.tools.work_clock.revision();
             let finished = self.tools.work_clock.advance();
-            if before_finish == started_revision {
+            let exact_required_command = kind == ToolKind::Command
+                && self.task.as_ref().is_some_and(|task| {
+                    let command = call
+                        .args
+                        .get("command")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .trim();
+                    task.contract.requirements.iter().any(|requirement| {
+                        matches!(&requirement.spec, task::RequirementSpec::Command(required) if required.trim() == command)
+                    })
+                });
+            if exact_required_command && before_finish == started_revision {
                 started_revision = finished;
             }
         }
@@ -1889,7 +1915,7 @@ impl Session {
             .as_ref()
             .map_or_else(Vec::new, |task| task.contract.restrictions.clone());
         let mut jobs = Vec::new();
-        for call in calls {
+        for (idx, call) in calls.iter().enumerate() {
             let started = self.start_call(call, harness);
             let scope = children.worktree_scope(&call.args);
             let prepared = if let Some(error) = &call.error {
@@ -1952,7 +1978,7 @@ impl Session {
                             restrictions,
                         )
                         .await;
-                        (call, started, result)
+                        (idx, call, started, result)
                     });
                 }
                 Err(error) => {
@@ -1969,19 +1995,32 @@ impl Session {
         }
         let mut running = futures_util::stream::iter(jobs)
             .buffer_unordered(crate::subagents::MAX_PARALLEL_SUBAGENTS);
-        while let Some((call, started, result)) = running.next().await {
+        let mut completed = Vec::new();
+        while let Some(item) = running.next().await {
+            completed.push(item);
+        }
+        completed.sort_by_key(|(idx, _, _, _)| *idx);
+        let any_shared = completed
+            .iter()
+            .any(|(_, _, _, result)| result.child.worktree.is_none());
+        if any_shared && let Some(parent) = &mut self.task {
+            parent.set_work_revision(self.tools.work_clock.revision());
+        }
+        for (_, call, started, result) in completed {
             // Evidence carries its real shared epoch and observation order.
             // Do not manufacture cross-child chronology from return order.
             if let (Some(parent), Some(child_task)) = (&mut self.task, &result.child.session.task) {
-                parent.set_work_revision(self.tools.work_clock.revision());
-                // Child paths/checks belong to its checkout, not the parent.
-                // Never certify files in the source tree using worktree checks.
+                // Child paths/checks in a worktree belong to its checkout, not
+                // the parent. Never let worktree revisions or checks overwrite
+                // parent workspace evidence.
                 if result.child.worktree.is_none() {
                     parent.absorb_child(child_task);
                 }
-                if let Some(assessment) = &child_task.assessment {
-                    parent.note_child(&result.child.id, assessment);
-                }
+                parent.note_child_report(
+                    &result.child.id,
+                    child_task,
+                    result.child.worktree.is_some(),
+                );
             }
             let mut args = std::collections::HashMap::new();
             for event in result.work {
@@ -2037,6 +2076,9 @@ impl Session {
             self.finish_call(call, result.outcome, harness, started, true)
                 .await;
             children.put(result.child);
+        }
+        if let Some(task) = &self.task {
+            harness.set_task_record(task);
         }
         self.subagents = Some(children);
     }

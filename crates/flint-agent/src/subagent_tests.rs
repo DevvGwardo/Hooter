@@ -536,6 +536,7 @@ async fn subagent_parallelism_is_bounded_to_four() {
 #[tokio::test]
 async fn subagent_edits_and_verification_count_as_parent_work() {
     let (_guard, ws) = temp_workspace();
+    let check = task_engine_tests::exists_check(&ws, "a.txt");
     let (url, _) = mock_server(vec![
         sse_tool_call(
             "delegate",
@@ -547,7 +548,7 @@ async fn subagent_edits_and_verification_count_as_parent_work() {
             "write_file",
             json!({"path": "a.txt", "content": "hi\n"}),
         ),
-        sse_tool_call("verify", "run_command", json!({"command": "test -s a.txt"})),
+        sse_tool_call("verify", "run_command", json!({"command": check})),
         sse_text("Created and verified."),
         sse_text("Completed."),
     ])
@@ -696,4 +697,60 @@ async fn failed_child_returns_its_id_instead_of_an_earlier_answer() {
     assert_eq!(output["session_id"], "agent-1");
     assert!(output["error"].as_str().expect("error").contains("400"));
     assert!(output.get("output").is_none());
+}
+
+#[tokio::test]
+async fn concurrent_non_worktree_children_keep_deterministic_order_and_current_verification() {
+    let (_guard, ws) = temp_workspace();
+    std::fs::write(ws.join("seed.txt"), "seed\n").unwrap();
+    let check_seed = task_engine_tests::exists_check(&ws, "seed.txt");
+    let (url, _) = mock_server(vec![
+        multi_spawn_task(2, "Write your output and verify seed.txt."),
+        sse_tool_call(
+            "write-a",
+            "write_file",
+            json!({"path": "a.txt", "content": "alpha\n"}),
+        ),
+        sse_tool_call(
+            "write-b",
+            "write_file",
+            json!({"path": "b.txt", "content": "beta\n"}),
+        ),
+        sse_tool_call("check-1", "run_command", json!({"command": check_seed})),
+        sse_tool_call("check-2", "run_command", json!({"command": check_seed})),
+        sse_text("Child verified."),
+        sse_text("Child verified."),
+        sse_text("Both children finished and verified."),
+    ])
+    .await;
+    let events = run_one_turn(url, ws, "Write a.txt and b.txt in parallel and verify.").await;
+    let finished_ids: Vec<&str> = events
+        .iter()
+        .filter_map(|event| match event {
+            AgentEvent::ToolCallFinished { call_id, .. } if call_id.starts_with("delegate-") => {
+                Some(call_id.as_str())
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(finished_ids, vec!["delegate-0", "delegate-1"]);
+    assert!(
+        !events.iter().any(|event| matches!(
+            event,
+            AgentEvent::HarnessNudge {
+                reason: NudgeReason::Verify,
+                ..
+            }
+        )),
+        "concurrent verified children should not trigger a false Verify nudge"
+    );
+    let task = events
+        .iter()
+        .rev()
+        .find_map(|event| match event {
+            AgentEvent::TaskAssessed { task, .. } => Some(task.as_ref()),
+            _ => None,
+        })
+        .expect("assessed task");
+    assert!(task.has_current_verification());
 }
