@@ -98,6 +98,32 @@ impl SubagentView {
         }
     }
 
+    pub fn workspace_mode_text(&self, parent: &SessionView) -> &'static str {
+        if self.workspace.is_some() {
+            "Isolated worktree"
+        } else if !self.view.changes.is_empty()
+            || self.view.items.iter().any(
+                |item| matches!(item, Item::Tool(call) if call.kind == flint_agent::ToolKind::Edit),
+            )
+        {
+            "Writable workspace"
+        } else if parent
+            .task
+            .as_ref()
+            .is_some_and(|task| task.contract.mode == flint_agent::TaskMode::ReadOnly)
+        {
+            "Read-only"
+        } else if parent
+            .task
+            .as_ref()
+            .is_some_and(|task| task.contract.mode == flint_agent::TaskMode::Work)
+        {
+            "Writable workspace"
+        } else {
+            "Shared workspace"
+        }
+    }
+
     pub fn status_text(&self, parent: &SessionView) -> &'static str {
         match self.status(parent) {
             Status::NeedsApproval => "Needs approval",
@@ -468,10 +494,11 @@ pub(crate) fn render(app: &FlintApp, uid: u64, id: &str, cx: &mut Context<FlintA
                         .text_size(px(size::XS))
                         .text_color(p.text_subtle)
                         .child(ui::one_line(&format!(
-                            "{} · {} · {} · Read-only",
+                            "{} · {} · {} · {}",
                             child.model,
                             child.session_id,
-                            child.status_text(&session.view)
+                            child.status_text(&session.view),
+                            child.workspace_mode_text(&session.view),
                         ))),
                 ),
         )

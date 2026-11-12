@@ -412,6 +412,30 @@ impl FlintApp {
         cx.notify();
     }
 
+    pub fn resume_task_panel_automatic(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.task_controls_available() {
+            return;
+        }
+        let uid = self.task_panel.as_ref().unwrap().target.parent;
+        let Some(ix) = self.session_index(uid) else {
+            return;
+        };
+        match self.resume_automatic_task_in(ix, cx) {
+            Ok(()) => {
+                self.close_task_details(window, cx);
+                cx.notify();
+            }
+            Err(reason) => {
+                if let Some(panel) = &mut self.task_panel
+                    && panel.target.parent == uid
+                {
+                    panel.error = Some(reason.into());
+                }
+                cx.notify();
+            }
+        }
+    }
+
     pub fn edit_task_scope(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if !self.task_controls_available() {
             return;
@@ -673,7 +697,8 @@ pub fn render(
     let task = app.task_for_panel()?;
     let p = palette();
     let controls = app.task_controls_available();
-    let session = &app.sessions[app.session_index(panel.target.parent)?];
+    let session_ix = app.session_index(panel.target.parent)?;
+    let session = &app.sessions[session_ix];
     let saving =
         session.task_update_pending.is_some() || panel.pending_review.is_some() || panel.saving;
     let latest = app
@@ -1029,6 +1054,14 @@ pub fn render(
         );
     }
     let confirmation = panel.confirm_accept.is_some();
+    let auto_fix_visible = app.settings.auto_continue_fixes
+        && task.source == TaskSource::Native
+        && task.contract.mode == TaskMode::Work
+        && outcome != TaskOutcome::Verified
+        && outcome != TaskOutcome::Accepted;
+    let auto_fix_blocked = auto_fix_visible
+        .then(|| app.automatic_resume_block_reason(session_ix, task))
+        .flatten();
     let footer = div().id("task-sheet-footer").relative().flex_shrink_0().px(px(20.)).py(px(14.))
         .border_t_1().border_color(p.border).flex().flex_col().gap(px(10.))
         .when(confirmation, |footer| footer.child(ui::label(
@@ -1082,11 +1115,10 @@ pub fn render(
                 .when(latest && panel.target.child.is_none(), |row| row
                     .child(Button::new("task-continue").label("Continue task").disabled(!controls)
                         .on_click(cx.listener(|app, _, window, cx| app.continue_task(window, cx))))
-                    .when(app.settings.auto_continue_fixes && task.source == TaskSource::Native
-                        && task.contract.mode == TaskMode::Work && outcome != TaskOutcome::Verified
-                        && outcome != TaskOutcome::Accepted, |row| row
-                        .child(Button::new("task-auto-fix").label("Auto-fix and review").disabled(!controls)
-                            .on_click(cx.listener(|app, _, _, cx| app.resume_automatic_task(cx)))))
+                    .when(auto_fix_visible, |row| row
+                        .child(Button::new("task-auto-fix").label("Auto-fix and review").disabled(!controls || auto_fix_blocked.is_some())
+                            .when_some(auto_fix_blocked, |button, reason| button.tooltip(reason))
+                            .on_click(cx.listener(|app, _, window, cx| app.resume_task_panel_automatic(window, cx)))))
                     .when(task.source == TaskSource::Native, |row| row
                         .child(Button::new("task-edit").label("Revise scope").disabled(!controls)
                             .on_click(cx.listener(|app, _, window, cx| app.edit_task_scope(window, cx)))))
@@ -1096,6 +1128,10 @@ pub fn render(
                 .when(!latest || panel.target.child.is_some(), |row| row.child(ui::label(
                     "Read-only details. Continue or accept from the latest parent task.", size::XS, p.text_muted,
                 )))))
+        .when(
+            panel.draft.is_none() && !confirmation && latest && panel.target.child.is_none() && controls,
+            |footer| footer.when_some(auto_fix_blocked, |footer, reason| footer.child(ui::label(reason, size::XS, p.text_muted))),
+        )
         .when(app.genui_error.is_some(), |footer| footer.child(ui::label(
             app.genui_error.unwrap_or(""), size::XS, p.warning,
         )))

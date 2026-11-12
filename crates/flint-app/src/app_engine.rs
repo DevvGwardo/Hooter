@@ -60,13 +60,28 @@ impl FlintApp {
         let mut notable = false;
         for event in events {
             self.capture_genui_event(uid, &event);
-            if matches!(
-                event,
-                AgentEvent::Error(_) | AgentEvent::SessionStopped { .. }
-            ) {
-                self.sessions[ix]
-                    .auto_continue
-                    .pause("An engine error or shutdown stopped automatic continuation.");
+            match &event {
+                AgentEvent::Error(message) => {
+                    if self.sessions[ix].view.running
+                        && crate::auto_continue::is_recoverable_error_notice(message)
+                    {
+                        self.sessions[ix]
+                            .auto_continue
+                            .pause_for_recoverable_error(
+                                "A recoverable engine error interrupted this step; waiting for the turn to finish.",
+                            );
+                    } else {
+                        self.sessions[ix]
+                            .auto_continue
+                            .pause("An engine error or shutdown stopped automatic continuation.");
+                    }
+                }
+                AgentEvent::SessionStopped { .. } => {
+                    self.sessions[ix]
+                        .auto_continue
+                        .pause("An engine error or shutdown stopped automatic continuation.");
+                }
+                _ => {}
             }
             match &event {
                 AgentEvent::TurnStarted { .. } => self.sessions[ix].prompt_pending = false,
@@ -74,6 +89,13 @@ impl FlintApp {
                     if self.sessions[ix].view.running
                         && *turn_id == self.sessions[ix].view.turn_id =>
                 {
+                    if matches!(reason, TurnEndReason::Completed) {
+                        self.sessions[ix]
+                            .auto_continue
+                            .clear_transient_error_pause();
+                    } else {
+                        self.sessions[ix].auto_continue.lock_transient_error_pause();
+                    }
                     if self.sessions[ix].view.pending_approvals > 0
                         || self.sessions[ix].view.has_pending_approval()
                     {

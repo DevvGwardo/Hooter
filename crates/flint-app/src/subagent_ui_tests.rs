@@ -262,3 +262,45 @@ fn session_applies_child_list_changes_in_batch_order() {
     assert_eq!(session.subagent_lists["agent-1"].item_count(), 2);
     assert_eq!(session.list.item_count(), 1);
 }
+
+#[test]
+fn subagent_workspace_mode_reflects_worktree_writable_and_read_only_contexts() {
+    let mut parent = SessionView::default();
+    start(&mut parent, "ro-call", "ro-child", "Audit.");
+    let mut ro_task = flint_agent::TaskRecord::new(1, "Inspect only, do not edit.".into(), 0);
+    ro_task.contract.mode = flint_agent::TaskMode::ReadOnly;
+    parent.task = Some(ro_task);
+    assert_eq!(
+        parent
+            .subagent("ro-child")
+            .unwrap()
+            .workspace_mode_text(&parent),
+        "Read-only"
+    );
+
+    let mut work_task = flint_agent::TaskRecord::new(2, "Fix the bug.".into(), 0);
+    work_task.contract.mode = flint_agent::TaskMode::Work;
+    parent.task = Some(work_task);
+    assert_eq!(
+        parent
+            .subagent("ro-child")
+            .unwrap()
+            .workspace_mode_text(&parent),
+        "Writable workspace"
+    );
+
+    parent.fold(
+        AgentEvent::SubagentWorkspace {
+            session_id: "ro-child".into(),
+            workspace: std::path::PathBuf::from("/tmp/worktree-1"),
+        },
+        Duration::ZERO,
+    );
+    assert_eq!(
+        parent
+            .subagent("ro-child")
+            .unwrap()
+            .workspace_mode_text(&parent),
+        "Isolated worktree"
+    );
+}
