@@ -534,13 +534,16 @@ fn usable_child_report_counts_as_observed_work_without_watchdog() {
     guard.record_tool_call("read_file", ToolKind::Read, &json!({"path":"a.rs"}), None);
     let mut task =
         crate::task::TaskRecord::new(1, "implement the requested module via subagents".into(), 0);
-    task.children.push(crate::task::ChildAssessment {
-        session_id: "child-1".to_string(),
-        task_id: 2,
-        outcome: crate::task::TaskOutcome::NeedsReview,
-        work_revision: 1,
-        issues: Vec::new(),
-    });
+    task.children.push(
+        serde_json::from_value(json!({
+            "session_id": "child-1",
+            "task_id": 2,
+            "outcome": crate::task::TaskOutcome::NeedsReview,
+            "work_revision": 1,
+            "issues": []
+        }))
+        .expect("child assessment"),
+    );
     guard.set_task_record(&task);
     assert_eq!(guard.finish_check(), None);
     assert_eq!(guard.before_finish(), None);
