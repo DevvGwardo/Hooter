@@ -253,6 +253,7 @@ impl Render for FlintApp {
             .capture_action(cx.listener(task_action_guard::<NewCodexSession>))
             .capture_action(cx.listener(task_action_guard::<NewDroidSession>))
             .capture_action(cx.listener(task_action_guard::<NewOpenCodeSession>))
+            .capture_action(cx.listener(task_action_guard::<NewHermesSession>))
             .capture_action(cx.listener(task_action_guard::<ToggleTerminal>))
             .capture_action(cx.listener(task_action_guard::<TogglePalette>))
             .capture_action(cx.listener(task_action_guard::<ToggleChanges>))
@@ -290,6 +291,9 @@ impl Render for FlintApp {
             }))
             .on_action(cx.listener(|this, _: &NewOpenCodeSession, window, cx| {
                 this.new_agent_session(AgentKind::OpenCode, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &NewHermesSession, window, cx| {
+                this.new_agent_session(AgentKind::Hermes, window, cx)
             }))
             .on_action(cx.listener(|this, _: &TogglePalette, window, cx| {
                 if this.palette.is_some() {

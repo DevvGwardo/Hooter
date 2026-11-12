@@ -10,12 +10,13 @@ use gpui_kit::*;
 use crate::app::FlintApp;
 
 /// Agents offered by the picker, in order.
-pub const AGENTS: [AgentKind; 5] = [
+pub const AGENTS: [AgentKind; 6] = [
     AgentKind::Flint,
     AgentKind::ClaudeCode,
     AgentKind::Codex,
     AgentKind::Droid,
     AgentKind::OpenCode,
+    AgentKind::Hermes,
 ];
 
 /// `/agent claude|codex|droid|opencode|hooter` typed into the composer.
@@ -26,6 +27,7 @@ pub fn parse_command(text: &str) -> Option<AgentKind> {
         "codex" => Some(AgentKind::Codex),
         "droid" | "factory" | "factory-droid" => Some(AgentKind::Droid),
         "opencode" | "open-code" | "open code" => Some(AgentKind::OpenCode),
+        "hermes" => Some(AgentKind::Hermes),
         "hooter" | "jevdex" | "flint" => Some(AgentKind::Flint),
         _ => None,
     }
@@ -39,6 +41,7 @@ pub fn about(kind: AgentKind) -> &'static str {
         AgentKind::Codex => "OpenAI's agent, on your ChatGPT plan (ACP)",
         AgentKind::Droid => "Factory's agent, on your Factory account (ACP)",
         AgentKind::OpenCode => "OpenCode, with your configured providers and models (ACP)",
+        AgentKind::Hermes => "Hermes Agent, with your configured providers and skills (ACP)",
     }
 }
 
@@ -101,9 +104,11 @@ impl FlintApp {
                     .as_deref()
                     .unwrap_or(&self.model)
             ),
-            AgentKind::ClaudeCode | AgentKind::Codex | AgentKind::Droid | AgentKind::OpenCode => {
-                kind.label().to_string()
-            }
+            AgentKind::ClaudeCode
+            | AgentKind::Codex
+            | AgentKind::Droid
+            | AgentKind::OpenCode
+            | AgentKind::Hermes => kind.label().to_string(),
         }
     }
 

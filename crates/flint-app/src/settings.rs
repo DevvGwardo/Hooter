@@ -405,6 +405,7 @@ pub(crate) fn agent_key(agent: flint_agent::AgentKind) -> &'static str {
         flint_agent::AgentKind::Codex => "codex",
         flint_agent::AgentKind::Droid => "droid",
         flint_agent::AgentKind::OpenCode => "opencode",
+        flint_agent::AgentKind::Hermes => "hermes",
     }
 }
 
@@ -416,6 +417,7 @@ pub(crate) fn agent_from_key(key: &str) -> Option<flint_agent::AgentKind> {
         "codex" => flint_agent::AgentKind::Codex,
         "droid" => flint_agent::AgentKind::Droid,
         "opencode" => flint_agent::AgentKind::OpenCode,
+        "hermes" => flint_agent::AgentKind::Hermes,
         _ => return None,
     })
 }

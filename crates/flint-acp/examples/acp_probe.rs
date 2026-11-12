@@ -20,6 +20,7 @@ fn main() {
         ("codex", AcpAgent::Codex),
         ("droid", AcpAgent::Droid),
         ("opencode", AcpAgent::OpenCode),
+        ("hermes", AcpAgent::Hermes),
     ] {
         if !wanted.is_empty() && !wanted.iter().any(|w| w == key) {
             continue;

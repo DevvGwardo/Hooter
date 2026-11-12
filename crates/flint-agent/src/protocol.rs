@@ -487,6 +487,8 @@ pub enum AgentKind {
     Droid,
     #[serde(rename = "opencode")]
     OpenCode,
+    #[serde(rename = "hermes")]
+    Hermes,
 }
 
 impl AgentKind {
@@ -498,6 +500,7 @@ impl AgentKind {
             AgentKind::Codex => "Codex",
             AgentKind::Droid => "Droid",
             AgentKind::OpenCode => "OpenCode",
+            AgentKind::Hermes => "Hermes",
         }
     }
 }

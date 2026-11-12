@@ -16,6 +16,8 @@ pub enum AcpAgent {
     Droid,
     /// OpenCode speaks ACP directly via `opencode acp`.
     OpenCode,
+    /// Hermes Agent speaks ACP directly via `hermes-acp`.
+    Hermes,
     /// Any other ACP agent: `command args…`.
     Custom {
         name: String,
@@ -32,6 +34,7 @@ impl AcpAgent {
             AcpAgent::Codex => "Codex",
             AcpAgent::Droid => "Droid",
             AcpAgent::OpenCode => "OpenCode",
+            AcpAgent::Hermes => "Hermes",
             AcpAgent::Custom { name, .. } => name,
         }
     }
@@ -43,6 +46,7 @@ impl AcpAgent {
             AcpAgent::Codex => "codex".to_string(),
             AcpAgent::Droid => "droid".to_string(),
             AcpAgent::OpenCode => "opencode".to_string(),
+            AcpAgent::Hermes => "hermes".to_string(),
             AcpAgent::Custom { name, .. } => name.to_lowercase(),
         }
     }
@@ -54,6 +58,7 @@ impl AcpAgent {
             AcpAgent::Codex => "codex".to_string(),
             AcpAgent::Droid => "droid".to_string(),
             AcpAgent::OpenCode => "opencode".to_string(),
+            AcpAgent::Hermes => "hermes".to_string(),
             AcpAgent::Custom { name, .. } => format!("custom:{name}"),
         }
     }
@@ -66,6 +71,7 @@ impl AcpAgent {
             AgentKind::Codex => Some(AcpAgent::Codex),
             AgentKind::Droid => Some(AcpAgent::Droid),
             AgentKind::OpenCode => Some(AcpAgent::OpenCode),
+            AgentKind::Hermes => Some(AcpAgent::Hermes),
         }
     }
 
@@ -76,7 +82,9 @@ impl AcpAgent {
                 Some(("claude-agent-acp", "@agentclientprotocol/claude-agent-acp"))
             }
             AcpAgent::Codex => Some(("codex-acp", "@agentclientprotocol/codex-acp")),
-            AcpAgent::Droid | AcpAgent::OpenCode | AcpAgent::Custom { .. } => None,
+            AcpAgent::Droid | AcpAgent::OpenCode | AcpAgent::Hermes | AcpAgent::Custom { .. } => {
+                None
+            }
         }
     }
 
@@ -90,6 +98,9 @@ impl AcpAgent {
                 return "Install a Windows-compatible Factory Droid build, add it to PATH, then retry.".to_string();
             }
             return "Install Droid with `npm i -g droid` or `brew install --cask droid`, then retry.".to_string();
+        }
+        if *self == AcpAgent::Hermes {
+            return "Install Hermes Agent with its `[acp]` extra (`uv pip install -e .[acp]` in your checkout) so `hermes-acp` is on PATH, or point a `hermes` key setup at `hermes-acp --setup`, then retry.".to_string();
         }
         match self.adapter() {
             Some((_, package)) => format!("Install it with `npm i -g {package}`, then retry."),
@@ -108,6 +119,10 @@ impl AcpAgent {
             AcpAgent::OpenCode => {
                 "Run `opencode auth login` in a terminal, then retry.".to_string()
             }
+            AcpAgent::Hermes => {
+                "Configure a Hermes provider with `hermes-acp --setup` in a terminal, then retry."
+                    .to_string()
+            }
             AcpAgent::Custom { name, .. } => format!("Log in to {name}, then retry."),
         }
     }
@@ -125,6 +140,15 @@ impl AcpAgent {
                 .ok_or_else(|| {
                     format!(
                         "OpenCode (`opencode`) isn't installed or isn't on PATH. {}",
+                        self.install_hint()
+                    )
+                }),
+            AcpAgent::Hermes => find("hermes-acp", venv_search_path())
+                .or_else(|| find("hermes-acp", search_path))
+                .map(|program| (program, Vec::new()))
+                .ok_or_else(|| {
+                    format!(
+                        "Hermes (`hermes-acp`) isn't installed or isn't on PATH. {}",
                         self.install_hint()
                     )
                 }),
@@ -193,9 +217,11 @@ impl AcpAgent {
         let api_key = matches!(name, "ANTHROPIC_API_KEY" | "ANTHROPIC_AUTH_TOKEN");
         match self {
             AcpAgent::ClaudeCode => session_marker || (api_key && !keep_api_key),
-            AcpAgent::Codex | AcpAgent::Droid | AcpAgent::OpenCode | AcpAgent::Custom { .. } => {
-                session_marker
-            }
+            AcpAgent::Codex
+            | AcpAgent::Droid
+            | AcpAgent::OpenCode
+            | AcpAgent::Hermes
+            | AcpAgent::Custom { .. } => session_marker,
         }
     }
 }
@@ -203,6 +229,26 @@ impl AcpAgent {
 /// PATH for GUI-launched adapters, preserving the platform's path separator.
 pub fn search_path(home: Option<&Path>) -> OsString {
     flint_platform::search_path(home)
+}
+
+/// Where a dedicated Hermes venv lives (`$FLINT_HOME/hermes-venv`, default
+/// `~/.flint/hermes-venv`). Searched before PATH so a managed adapter install
+/// (kept current with the checkout it was built from) wins over an older
+/// system-wide `hermes-acp` that may predate Windows ACP fixes.
+fn venv_search_path() -> OsString {
+    let root = std::env::var_os("FLINT_HOME")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| flint_platform::home_dir().map(|home| home.join(".flint")));
+    let Some(root) = root else {
+        return OsString::new();
+    };
+    let bin = if cfg!(windows) {
+        root.join("hermes-venv").join("Scripts")
+    } else {
+        root.join("hermes-venv").join("bin")
+    };
+    std::env::join_paths([bin]).unwrap_or_default()
 }
 
 /// `name` itself if it is a path, else the first match on `search_path`.
@@ -259,6 +305,9 @@ pub fn looks_like_auth_error(code: Option<i64>, message: &str) -> bool {
 mod tests {
     use super::*;
     use pretty_assertions::assert_eq;
+
+    /// Serializes tests that mutate process env (`FLINT_HOME`).
+    static FLINT_TEST_ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[cfg(windows)]
     #[test]
@@ -342,6 +391,69 @@ mod tests {
         for key in ["OPENCODE_API_KEY", "ANTHROPIC_API_KEY", "OPENAI_API_KEY"] {
             assert!(!AcpAgent::OpenCode.drops_env(key, false));
         }
+    }
+
+    #[test]
+    fn hermes_uses_its_native_acp_server_without_an_adapter_or_npx() {
+        // `FLINT_HOME` steers the managed-venv lookup; serialize the mutation.
+        let _env = FLINT_TEST_ENV.lock().unwrap();
+        let flint_home = tempfile::tempdir().expect("tempdir");
+        // SAFETY: single-threaded by the lock above; no other test reads FLINT_HOME.
+        unsafe { std::env::set_var("FLINT_HOME", flint_home.path()) };
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = std::env::join_paths([dir.path()]).unwrap();
+        std::fs::write(dir.path().join("npx"), "").unwrap();
+        let missing = AcpAgent::Hermes.command(&path).expect_err("missing Hermes");
+        assert!(missing.contains("hermes-acp"), "{missing}");
+        assert!(missing.contains("isn't installed"), "{missing}");
+        let binary = if cfg!(windows) {
+            "hermes-acp.exe"
+        } else {
+            "hermes-acp"
+        };
+        std::fs::write(dir.path().join(binary), "").unwrap();
+        assert_eq!(
+            AcpAgent::Hermes.command(&path),
+            Ok((dir.path().join(binary), Vec::new()))
+        );
+        assert_eq!(
+            AcpAgent::for_kind(AgentKind::Hermes),
+            Some(AcpAgent::Hermes)
+        );
+        assert_eq!(AcpAgent::Hermes.name(), "Hermes");
+        assert_eq!(AcpAgent::Hermes.id(), "hermes");
+        assert_eq!(AcpAgent::Hermes.label_prefix(), "hermes");
+        assert!(AcpAgent::Hermes.drops_env("CLAUDECODE", false));
+        for key in ["HERMES_API_KEY", "ANTHROPIC_API_KEY", "OPENAI_API_KEY"] {
+            assert!(!AcpAgent::Hermes.drops_env(key, false));
+        }
+    }
+
+    #[test]
+    fn hermes_prefers_the_managed_venv_over_path() {
+        let _env = FLINT_TEST_ENV.lock().unwrap();
+        let flint_home = tempfile::tempdir().expect("tempdir");
+        let venv_bin = if cfg!(windows) {
+            flint_home.path().join("hermes-venv").join("Scripts")
+        } else {
+            flint_home.path().join("hermes-venv").join("bin")
+        };
+        std::fs::create_dir_all(&venv_bin).expect("mkdir");
+        let binary = if cfg!(windows) {
+            "hermes-acp.exe"
+        } else {
+            "hermes-acp"
+        };
+        std::fs::write(venv_bin.join(binary), "").expect("write");
+        // SAFETY: single-threaded by the lock above; no other test reads FLINT_HOME.
+        unsafe { std::env::set_var("FLINT_HOME", flint_home.path()) };
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join(binary), "").expect("write");
+        let path = std::env::join_paths([dir.path()]).unwrap();
+        assert_eq!(
+            AcpAgent::Hermes.command(&path),
+            Ok((venv_bin.join(binary), Vec::new()))
+        );
     }
 
     #[test]

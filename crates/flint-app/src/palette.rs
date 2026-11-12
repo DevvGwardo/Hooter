@@ -19,6 +19,7 @@ use crate::app::Interrupt;
 use crate::app::NewClaudeSession;
 use crate::app::NewCodexSession;
 use crate::app::NewDroidSession;
+use crate::app::NewHermesSession;
 use crate::app::NewOpenCodeSession;
 use crate::app::NewSession;
 use crate::app::OpenSettings;
@@ -90,6 +91,11 @@ pub fn render(
                     "New OpenCode session",
                     IconName::Bot,
                     Box::new(NewOpenCodeSession),
+                ))
+                .item(item(
+                    "New Hermes session",
+                    IconName::Bot,
+                    Box::new(NewHermesSession),
                 ))
                 .item(item(
                     "Stop the running turn",

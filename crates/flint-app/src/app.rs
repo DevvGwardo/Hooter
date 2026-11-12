@@ -28,6 +28,7 @@ actions!(
         NewCodexSession,
         NewDroidSession,
         NewOpenCodeSession,
+        NewHermesSession,
         TogglePalette,
         ToggleChanges,
         ToggleSidebar,
