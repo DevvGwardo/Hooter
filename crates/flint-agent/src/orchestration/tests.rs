@@ -1741,6 +1741,7 @@ fn validate_state_and_read_only_helpers_reject_invalid_saved_target() {
 }
 
 #[test]
+#[allow(clippy::type_complexity)]
 fn validate_limits_rejects_zero_or_over_bounds_for_all_fields() {
     let cases: Vec<(&str, fn(&mut EngineLimits, usize))> = vec![
         ("queued_commands", |l, v| l.queued_commands = v),

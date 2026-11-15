@@ -1066,7 +1066,7 @@ fn private_directory_if_present(path: &Path) -> Result<(), Error> {
         {
             return Err(Error::Storage);
         }
-        return check_windows_private_acl(dir.as_raw_handle());
+        check_windows_private_acl(dir.as_raw_handle())
     }
     #[cfg(not(any(unix, windows)))]
     {
@@ -1091,7 +1091,7 @@ fn private_file(lease: &WriterLease, name: &str, limit: usize) -> Result<(), Err
     #[cfg(windows)]
     {
         use std::os::windows::io::AsRawHandle as _;
-        return check_windows_private_acl(file.as_raw_handle());
+        check_windows_private_acl(file.as_raw_handle())
     }
     #[cfg(not(any(unix, windows)))]
     {
