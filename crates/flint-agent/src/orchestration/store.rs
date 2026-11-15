@@ -31,8 +31,29 @@ pub(crate) struct State {
     pub receipt_head: Option<String>,
     pub receipt_count: u64,
     pub pending: Vec<Pending>,
+    #[serde(default)]
+    pub queue_revision: Option<u64>,
+    #[serde(default)]
+    pub paused: bool,
+    #[serde(default)]
+    pub intents: Vec<SideEffectIntent>,
+    #[serde(default)]
+    pub terminal_receipts: HashMap<CommandId, CommandReceipt>,
     #[serde(flatten)]
     pub extra: BTreeMap<String, Value>,
+}
+
+impl State {
+    pub fn queue_revision(&self) -> u64 {
+        self.queue_revision.unwrap_or(self.revision)
+    }
+
+    pub fn advance_queue_revision(&mut self) -> Result<u64, EngineError> {
+        let current = self.queue_revision();
+        let next = current.checked_add(1).ok_or_else(corrupt)?;
+        self.queue_revision = Some(next);
+        Ok(next)
+    }
 }
 #[derive(Serialize, Deserialize)]
 struct Envelope {
@@ -109,14 +130,88 @@ pub(crate) fn canonical_command(command: &EngineCommand) -> Result<(Vec<u8>, Dig
 }
 
 pub(crate) fn validate_intake(command: &EngineCommand) -> Result<(), EngineError> {
-    let CommandPayload::Send {
-        prompt,
-        delivery: Delivery::NextTurn,
-    } = &command.payload
-    else {
-        return Err(EngineError::unsupported());
-    };
-    validate_prompt(prompt)
+    match &command.payload {
+        CommandPayload::Send {
+            prompt,
+            delivery: Delivery::NextTurn,
+        } => validate_prompt(prompt),
+        CommandPayload::CancelQueued {
+            expected_queue_revision,
+            ..
+        } => {
+            if *expected_queue_revision == 0 {
+                return Err(EngineError::new(
+                    EngineErrorCode::InvalidCommand,
+                    "Expected queue revision must be greater than zero.",
+                ));
+            }
+            Ok(())
+        }
+        CommandPayload::ReplaceQueued {
+            command_id,
+            expected_queue_revision,
+            replacement,
+        } => {
+            if *expected_queue_revision == 0 {
+                return Err(EngineError::new(
+                    EngineErrorCode::InvalidCommand,
+                    "Expected queue revision must be greater than zero.",
+                ));
+            }
+            if replacement.id == *command_id || replacement.id == command.id {
+                return Err(EngineError::new(
+                    EngineErrorCode::InvalidCommand,
+                    "Replacement command must have a fresh identity.",
+                ));
+            }
+            if replacement.conversation != command.conversation {
+                return Err(EngineError::new(
+                    EngineErrorCode::InvalidCommand,
+                    "Replacement command conversation mismatch.",
+                ));
+            }
+            match &replacement.payload {
+                CommandPayload::Send {
+                    prompt,
+                    delivery: Delivery::NextTurn,
+                } => validate_prompt(prompt),
+                _ => Err(EngineError::new(
+                    EngineErrorCode::InvalidCommand,
+                    "Replacement payload must be a Send command with NextTurn delivery.",
+                )),
+            }
+        }
+        CommandPayload::PauseQueue {
+            expected_queue_revision,
+        } => {
+            if *expected_queue_revision == 0 {
+                return Err(EngineError::new(
+                    EngineErrorCode::InvalidCommand,
+                    "Expected queue revision must be greater than zero.",
+                ));
+            }
+            Ok(())
+        }
+        CommandPayload::ResumeQueue {
+            expected_queue_revision,
+            restart_generation,
+        } => {
+            if *expected_queue_revision == 0 {
+                return Err(EngineError::new(
+                    EngineErrorCode::InvalidCommand,
+                    "Expected queue revision must be greater than zero.",
+                ));
+            }
+            if *restart_generation == 0 {
+                return Err(EngineError::new(
+                    EngineErrorCode::InvalidCommand,
+                    "Restart generation must be greater than zero.",
+                ));
+            }
+            Ok(())
+        }
+        _ => Err(EngineError::unsupported()),
+    }
 }
 
 pub(crate) fn read_document(directory: &Directory) -> Result<Option<Value>, EngineError> {
@@ -168,8 +263,15 @@ pub(crate) fn validate_state(state: &State) -> Result<(), EngineError> {
             .as_ref()
             .is_some_and(|name| !valid_object(name))
         || (state.receipt_head.is_none() != (state.receipt_count == 0))
+        || state.intents.len() > 32
+        || state.queue_revision.is_some_and(|rev| rev == 0)
     {
         return Err(corrupt());
+    }
+    for intent in &state.intents {
+        if intent.conversation.root != state.root {
+            return Err(corrupt());
+        }
     }
     let mut bytes = 0usize;
     for (index, entry) in state.pending.iter().enumerate() {
@@ -338,6 +440,10 @@ impl Store {
                 receipt_head: None,
                 receipt_count: 0,
                 pending: Vec::new(),
+                queue_revision: Some(1),
+                paused: true,
+                intents: Vec::new(),
+                terminal_receipts: HashMap::new(),
                 extra: BTreeMap::new(),
             }
         };
@@ -380,6 +486,9 @@ impl Store {
                 next = node.previous;
                 ordinal -= 1;
             }
+            for (id, receipt) in &state.terminal_receipts {
+                store.retained_index.insert(id.clone(), receipt.clone());
+            }
         }
         // read_document already proved membership in the canonical lineage
         // before this owner can create objects or commit recovery. Only active
@@ -390,14 +499,33 @@ impl Store {
         state.generation = state.generation.checked_add(1).ok_or_else(corrupt)?;
         if existing {
             state.revision = state.revision.checked_add(1).ok_or_else(corrupt)?;
+            state.paused = true;
+        }
+        let mut ambiguous_intents = Vec::new();
+        for intent in &mut state.intents {
+            if matches!(intent.state, IntentState::Dispatching) {
+                intent.state = IntentState::Ambiguous;
+                ambiguous_intents.push(intent.id);
+            }
         }
         for pending in &mut state.pending {
             match &pending.receipt.state {
                 CommandState::Started { run_id, .. } => {
                     pending.receipt.status_revision = state.revision;
+                    let matching: Vec<u64> = state
+                        .intents
+                        .iter()
+                        .filter(|i| &i.run_id == run_id && i.state == IntentState::Ambiguous)
+                        .map(|i| i.id)
+                        .collect();
+                    let intent_ids = if matching.is_empty() {
+                        ambiguous_intents.clone()
+                    } else {
+                        matching
+                    };
                     pending.receipt.state = CommandState::Held(HoldReason::AmbiguousEffects {
                         run_id: run_id.clone(),
-                        intent_ids: Vec::new(),
+                        intent_ids,
                     });
                 }
                 CommandState::Accepted | CommandState::Held(HoldReason::Restart { .. }) => {
@@ -430,6 +558,9 @@ impl Store {
         {
             return Ok(Some(entry.receipt.clone()));
         }
+        if let Some(receipt) = self.state.terminal_receipts.get(id) {
+            return Ok(Some(receipt.clone()));
+        }
         Ok(self.retained_index.get(id).cloned())
     }
 
@@ -461,76 +592,436 @@ impl Store {
             return Ok(receipt);
         }
         self.owned(&command.conversation)?;
-        let CommandPayload::Send {
-            prompt,
-            delivery: Delivery::NextTurn,
-        } = &command.payload
-        else {
-            return Err(EngineError::unsupported());
-        };
-        validate_prompt(prompt)?;
-        if self.state.pending.len() >= self.limits.queued_commands
-            || bytes.len().saturating_add(
-                self.state
+        match &command.payload {
+            CommandPayload::Send {
+                prompt,
+                delivery: Delivery::NextTurn,
+            } => {
+                validate_prompt(prompt)?;
+                if self.state.pending.len() >= self.limits.queued_commands
+                    || bytes.len().saturating_add(
+                        self.state
+                            .pending
+                            .iter()
+                            .map(|entry| entry.bytes)
+                            .sum::<usize>(),
+                    ) > self.limits.queued_bytes
+                {
+                    return Err(EngineError::new(
+                        EngineErrorCode::QueueFull,
+                        "Engine queue capacity reached.",
+                    ));
+                }
+                let mut state = self.state.clone();
+                state.revision = state.revision.checked_add(1).ok_or_else(corrupt)?;
+                state.advance_queue_revision()?;
+                let receipt = CommandReceipt {
+                    id: command.id.clone(),
+                    conversation: command.conversation.clone(),
+                    task: None,
+                    payload_digest,
+                    accepted_sequence: state.next_sequence,
+                    accepted_revision: state.revision,
+                    status_revision: state.revision,
+                    state: CommandState::Accepted,
+                };
+                state.next_sequence = state.next_sequence.checked_add(1).ok_or_else(corrupt)?;
+                state.receipt_count = state.receipt_count.checked_add(1).ok_or_else(corrupt)?;
+                let object = object_name(&bytes);
+                self.fail("object")?;
+                self.objects.immutable(&object, &bytes).map_err(storage)?;
+                let node = Node {
+                    version: 1,
+                    receipt: receipt.clone(),
+                    command_object: object.clone(),
+                    previous: state.receipt_head.clone(),
+                    ordinal: state.receipt_count,
+                };
+                let node_bytes = serde_json::to_vec(&node).map_err(|_| corrupt())?;
+                let node_name = object_name(&node_bytes);
+                self.fail("receipt")?;
+                self.objects
+                    .immutable(&node_name, &node_bytes)
+                    .map_err(storage)?;
+                state.receipt_head = Some(node_name.clone());
+                let preview: String = prompt
+                    .request
+                    .chars()
+                    .scan(0usize, |size, ch| {
+                        *size += ch.len_utf8();
+                        (*size <= 512).then_some(ch)
+                    })
+                    .collect();
+                state.pending.push(Pending {
+                    receipt: receipt.clone(),
+                    object,
+                    acceptance: node_name,
+                    bytes: bytes.len(),
+                    preview,
+                });
+                self.commit(state)?;
+                Ok(receipt)
+            }
+            CommandPayload::CancelQueued {
+                command_id,
+                expected_queue_revision,
+            } => {
+                if *expected_queue_revision != self.state.queue_revision() {
+                    return Err(EngineError::new(
+                        EngineErrorCode::StaleRevision,
+                        "Queue revision conflict.",
+                    ));
+                }
+                let target_index = self
+                    .state
                     .pending
                     .iter()
-                    .map(|entry| entry.bytes)
-                    .sum::<usize>(),
-            ) > self.limits.queued_bytes
-        {
-            return Err(EngineError::new(
-                EngineErrorCode::QueueFull,
-                "Engine queue capacity reached.",
-            ));
+                    .position(|e| &e.receipt.id == command_id)
+                    .ok_or_else(|| {
+                        EngineError::new(EngineErrorCode::NotFound, "Queued command not found.")
+                    })?;
+                let target = &self.state.pending[target_index];
+                if matches!(target.receipt.state, CommandState::Started { .. }) {
+                    return Err(EngineError::new(
+                        EngineErrorCode::InvalidCommand,
+                        "Cannot cancel a started command.",
+                    ));
+                }
+                let mut state = self.state.clone();
+                state.revision = state.revision.checked_add(1).ok_or_else(corrupt)?;
+                state.advance_queue_revision()?;
+                let removed = state.pending.remove(target_index);
+                let mut cancelled_receipt = removed.receipt;
+                cancelled_receipt.status_revision = state.revision;
+                cancelled_receipt.state = CommandState::Finished {
+                    run_id: None,
+                    turn_id: None,
+                    reason: CommandFinish::CancelledBeforeStart,
+                };
+                state
+                    .terminal_receipts
+                    .insert(command_id.clone(), cancelled_receipt.clone());
+                self.retained_index
+                    .insert(command_id.clone(), cancelled_receipt);
+
+                let control_receipt = CommandReceipt {
+                    id: command.id.clone(),
+                    conversation: command.conversation.clone(),
+                    task: None,
+                    payload_digest,
+                    accepted_sequence: state.next_sequence,
+                    accepted_revision: state.revision,
+                    status_revision: state.revision,
+                    state: CommandState::Finished {
+                        run_id: None,
+                        turn_id: None,
+                        reason: CommandFinish::Applied,
+                    },
+                };
+                state.next_sequence = state.next_sequence.checked_add(1).ok_or_else(corrupt)?;
+                state.receipt_count = state.receipt_count.checked_add(1).ok_or_else(corrupt)?;
+                let object = object_name(&bytes);
+                self.fail("object")?;
+                self.objects.immutable(&object, &bytes).map_err(storage)?;
+                let node = Node {
+                    version: 1,
+                    receipt: control_receipt.clone(),
+                    command_object: object,
+                    previous: state.receipt_head.clone(),
+                    ordinal: state.receipt_count,
+                };
+                let node_bytes = serde_json::to_vec(&node).map_err(|_| corrupt())?;
+                let node_name = object_name(&node_bytes);
+                self.fail("receipt")?;
+                self.objects
+                    .immutable(&node_name, &node_bytes)
+                    .map_err(storage)?;
+                state.receipt_head = Some(node_name);
+                self.retained_index
+                    .insert(command.id.clone(), control_receipt.clone());
+                self.commit(state)?;
+                Ok(control_receipt)
+            }
+            CommandPayload::ReplaceQueued {
+                command_id,
+                expected_queue_revision,
+                replacement,
+            } => {
+                if *expected_queue_revision != self.state.queue_revision() {
+                    return Err(EngineError::new(
+                        EngineErrorCode::StaleRevision,
+                        "Queue revision conflict.",
+                    ));
+                }
+                let target_index = self
+                    .state
+                    .pending
+                    .iter()
+                    .position(|e| &e.receipt.id == command_id)
+                    .ok_or_else(|| {
+                        EngineError::new(EngineErrorCode::NotFound, "Queued command not found.")
+                    })?;
+                let target = &self.state.pending[target_index];
+                if matches!(target.receipt.state, CommandState::Started { .. }) {
+                    return Err(EngineError::new(
+                        EngineErrorCode::InvalidCommand,
+                        "Cannot replace a started command.",
+                    ));
+                }
+                if self.retained(&replacement.id)?.is_some() {
+                    return Err(EngineError::new(
+                        EngineErrorCode::IdentityConflict,
+                        "Replacement command identity already exists.",
+                    ));
+                }
+                let CommandPayload::Send { prompt, .. } = &replacement.payload else {
+                    return Err(EngineError::new(
+                        EngineErrorCode::InvalidCommand,
+                        "Replacement payload must be Send.",
+                    ));
+                };
+                let (replacement_bytes, replacement_digest) = canonical_command(replacement)?;
+                let old_pending_bytes = self.state.pending[target_index].bytes;
+                let current_bytes: usize = self.state.pending.iter().map(|e| e.bytes).sum();
+                let new_bytes = current_bytes
+                    .saturating_sub(old_pending_bytes)
+                    .saturating_add(replacement_bytes.len());
+                if new_bytes > self.limits.queued_bytes {
+                    return Err(EngineError::new(
+                        EngineErrorCode::QueueFull,
+                        "Engine queue capacity reached.",
+                    ));
+                }
+                let mut state = self.state.clone();
+                state.revision = state.revision.checked_add(1).ok_or_else(corrupt)?;
+                state.advance_queue_revision()?;
+
+                let replacement_object = object_name(&replacement_bytes);
+                self.objects
+                    .immutable(&replacement_object, &replacement_bytes)
+                    .map_err(storage)?;
+
+                let replacement_receipt = CommandReceipt {
+                    id: replacement.id.clone(),
+                    conversation: replacement.conversation.clone(),
+                    task: None,
+                    payload_digest: replacement_digest,
+                    accepted_sequence: state.next_sequence,
+                    accepted_revision: state.revision,
+                    status_revision: state.revision,
+                    state: CommandState::Accepted,
+                };
+                state.next_sequence = state.next_sequence.checked_add(1).ok_or_else(corrupt)?;
+                state.receipt_count = state.receipt_count.checked_add(1).ok_or_else(corrupt)?;
+                let replacement_node = Node {
+                    version: 1,
+                    receipt: replacement_receipt.clone(),
+                    command_object: replacement_object.clone(),
+                    previous: state.receipt_head.clone(),
+                    ordinal: state.receipt_count,
+                };
+                let rnode_bytes = serde_json::to_vec(&replacement_node).map_err(|_| corrupt())?;
+                let rnode_name = object_name(&rnode_bytes);
+                self.objects
+                    .immutable(&rnode_name, &rnode_bytes)
+                    .map_err(storage)?;
+                state.receipt_head = Some(rnode_name.clone());
+
+                let preview: String = prompt
+                    .request
+                    .chars()
+                    .scan(0usize, |size, ch| {
+                        *size += ch.len_utf8();
+                        (*size <= 512).then_some(ch)
+                    })
+                    .collect();
+                state.pending[target_index] = Pending {
+                    receipt: replacement_receipt.clone(),
+                    object: replacement_object,
+                    acceptance: rnode_name,
+                    bytes: replacement_bytes.len(),
+                    preview,
+                };
+
+                let mut superseded_receipt = target.receipt.clone();
+                superseded_receipt.status_revision = state.revision;
+                superseded_receipt.state = CommandState::Finished {
+                    run_id: None,
+                    turn_id: None,
+                    reason: CommandFinish::Superseded {
+                        replacement: replacement.id.clone(),
+                    },
+                };
+                state
+                    .terminal_receipts
+                    .insert(command_id.clone(), superseded_receipt.clone());
+                self.retained_index
+                    .insert(command_id.clone(), superseded_receipt);
+                self.retained_index
+                    .insert(replacement.id.clone(), replacement_receipt);
+
+                let control_receipt = CommandReceipt {
+                    id: command.id.clone(),
+                    conversation: command.conversation.clone(),
+                    task: None,
+                    payload_digest,
+                    accepted_sequence: state.next_sequence,
+                    accepted_revision: state.revision,
+                    status_revision: state.revision,
+                    state: CommandState::Finished {
+                        run_id: None,
+                        turn_id: None,
+                        reason: CommandFinish::Applied,
+                    },
+                };
+                state.next_sequence = state.next_sequence.checked_add(1).ok_or_else(corrupt)?;
+                state.receipt_count = state.receipt_count.checked_add(1).ok_or_else(corrupt)?;
+                let control_object = object_name(&bytes);
+                self.objects
+                    .immutable(&control_object, &bytes)
+                    .map_err(storage)?;
+                let control_node = Node {
+                    version: 1,
+                    receipt: control_receipt.clone(),
+                    command_object: control_object,
+                    previous: state.receipt_head.clone(),
+                    ordinal: state.receipt_count,
+                };
+                let cnode_bytes = serde_json::to_vec(&control_node).map_err(|_| corrupt())?;
+                let cnode_name = object_name(&cnode_bytes);
+                self.objects
+                    .immutable(&cnode_name, &cnode_bytes)
+                    .map_err(storage)?;
+                state.receipt_head = Some(cnode_name);
+                self.retained_index
+                    .insert(command.id.clone(), control_receipt.clone());
+
+                self.commit(state)?;
+                Ok(control_receipt)
+            }
+            CommandPayload::PauseQueue {
+                expected_queue_revision,
+            } => {
+                if *expected_queue_revision != self.state.queue_revision() {
+                    return Err(EngineError::new(
+                        EngineErrorCode::StaleRevision,
+                        "Queue revision conflict.",
+                    ));
+                }
+                let mut state = self.state.clone();
+                state.revision = state.revision.checked_add(1).ok_or_else(corrupt)?;
+                state.advance_queue_revision()?;
+                state.paused = true;
+
+                let control_receipt = CommandReceipt {
+                    id: command.id.clone(),
+                    conversation: command.conversation.clone(),
+                    task: None,
+                    payload_digest,
+                    accepted_sequence: state.next_sequence,
+                    accepted_revision: state.revision,
+                    status_revision: state.revision,
+                    state: CommandState::Finished {
+                        run_id: None,
+                        turn_id: None,
+                        reason: CommandFinish::Applied,
+                    },
+                };
+                state.next_sequence = state.next_sequence.checked_add(1).ok_or_else(corrupt)?;
+                state.receipt_count = state.receipt_count.checked_add(1).ok_or_else(corrupt)?;
+                let object = object_name(&bytes);
+                self.fail("object")?;
+                self.objects.immutable(&object, &bytes).map_err(storage)?;
+                let node = Node {
+                    version: 1,
+                    receipt: control_receipt.clone(),
+                    command_object: object,
+                    previous: state.receipt_head.clone(),
+                    ordinal: state.receipt_count,
+                };
+                let node_bytes = serde_json::to_vec(&node).map_err(|_| corrupt())?;
+                let node_name = object_name(&node_bytes);
+                self.fail("receipt")?;
+                self.objects
+                    .immutable(&node_name, &node_bytes)
+                    .map_err(storage)?;
+                state.receipt_head = Some(node_name);
+                self.retained_index
+                    .insert(command.id.clone(), control_receipt.clone());
+                self.commit(state)?;
+                Ok(control_receipt)
+            }
+            CommandPayload::ResumeQueue {
+                expected_queue_revision,
+                restart_generation,
+            } => {
+                if *expected_queue_revision != self.state.queue_revision() {
+                    return Err(EngineError::new(
+                        EngineErrorCode::StaleRevision,
+                        "Queue revision conflict.",
+                    ));
+                }
+                if *restart_generation != self.state.generation {
+                    return Err(EngineError::new(
+                        EngineErrorCode::StaleRevision,
+                        "Restart generation conflict.",
+                    ));
+                }
+                let mut state = self.state.clone();
+                state.revision = state.revision.checked_add(1).ok_or_else(corrupt)?;
+                state.advance_queue_revision()?;
+                state.paused = false;
+                for pending in &mut state.pending {
+                    if matches!(
+                        pending.receipt.state,
+                        CommandState::Held(HoldReason::Paused)
+                            | CommandState::Held(HoldReason::Restart { .. })
+                    ) {
+                        pending.receipt.status_revision = state.revision;
+                        pending.receipt.state = CommandState::Accepted;
+                    }
+                }
+
+                let control_receipt = CommandReceipt {
+                    id: command.id.clone(),
+                    conversation: command.conversation.clone(),
+                    task: None,
+                    payload_digest,
+                    accepted_sequence: state.next_sequence,
+                    accepted_revision: state.revision,
+                    status_revision: state.revision,
+                    state: CommandState::Finished {
+                        run_id: None,
+                        turn_id: None,
+                        reason: CommandFinish::Applied,
+                    },
+                };
+                state.next_sequence = state.next_sequence.checked_add(1).ok_or_else(corrupt)?;
+                state.receipt_count = state.receipt_count.checked_add(1).ok_or_else(corrupt)?;
+                let object = object_name(&bytes);
+                self.fail("object")?;
+                self.objects.immutable(&object, &bytes).map_err(storage)?;
+                let node = Node {
+                    version: 1,
+                    receipt: control_receipt.clone(),
+                    command_object: object,
+                    previous: state.receipt_head.clone(),
+                    ordinal: state.receipt_count,
+                };
+                let node_bytes = serde_json::to_vec(&node).map_err(|_| corrupt())?;
+                let node_name = object_name(&node_bytes);
+                self.fail("receipt")?;
+                self.objects
+                    .immutable(&node_name, &node_bytes)
+                    .map_err(storage)?;
+                state.receipt_head = Some(node_name);
+                self.retained_index
+                    .insert(command.id.clone(), control_receipt.clone());
+                self.commit(state)?;
+                Ok(control_receipt)
+            }
+            _ => Err(EngineError::unsupported()),
         }
-        let mut state = self.state.clone();
-        state.revision = state.revision.checked_add(1).ok_or_else(corrupt)?;
-        let receipt = CommandReceipt {
-            id: command.id.clone(),
-            conversation: command.conversation.clone(),
-            task: None,
-            payload_digest,
-            accepted_sequence: state.next_sequence,
-            accepted_revision: state.revision,
-            status_revision: state.revision,
-            state: CommandState::Accepted,
-        };
-        state.next_sequence = state.next_sequence.checked_add(1).ok_or_else(corrupt)?;
-        state.receipt_count = state.receipt_count.checked_add(1).ok_or_else(corrupt)?;
-        let object = object_name(&bytes);
-        self.fail("object")?;
-        self.objects.immutable(&object, &bytes).map_err(storage)?;
-        let node = Node {
-            version: 1,
-            receipt: receipt.clone(),
-            command_object: object.clone(),
-            previous: state.receipt_head.clone(),
-            ordinal: state.receipt_count,
-        };
-        let node_bytes = serde_json::to_vec(&node).map_err(|_| corrupt())?;
-        let node_name = object_name(&node_bytes);
-        self.fail("receipt")?;
-        self.objects
-            .immutable(&node_name, &node_bytes)
-            .map_err(storage)?;
-        state.receipt_head = Some(node_name.clone());
-        let preview: String = prompt
-            .request
-            .chars()
-            .scan(0usize, |size, ch| {
-                *size += ch.len_utf8();
-                (*size <= 512).then_some(ch)
-            })
-            .collect();
-        state.pending.push(Pending {
-            receipt: receipt.clone(),
-            object,
-            acceptance: node_name,
-            bytes: bytes.len(),
-            preview,
-        });
-        self.commit(state)?;
-        Ok(receipt)
     }
 
     pub fn owned(&self, conversation: &ConversationId) -> Result<(), EngineError> {
@@ -553,11 +1044,11 @@ impl Store {
                 CommandState::Held(hold) => Some(hold.clone()),
                 _ => None,
             })
-            .or(Some(HoldReason::Paused));
+            .or(self.state.paused.then_some(HoldReason::Paused));
         Ok(QueueProjection {
-            revision: self.state.revision,
+            revision: self.state.queue_revision(),
             restart_generation: self.state.generation,
-            paused: true,
+            paused: self.state.paused,
             hold,
             items: self
                 .state
@@ -730,9 +1221,157 @@ impl Store {
                 .entry(entry.receipt.id.clone())
                 .or_insert_with(|| entry.receipt.clone());
         }
+        for (id, receipt) in &state.terminal_receipts {
+            self.retained_index.insert(id.clone(), receipt.clone());
+        }
         self.document = document;
         self.state = state;
         Ok(())
+    }
+
+    pub fn confirm_queue_continuation(
+        &self,
+        conversation: ConversationId,
+        revision: TaskRevision,
+        command_id: CommandId,
+        restart_generation: u64,
+    ) -> Result<QueueContinuationPermit, EngineError> {
+        self.owned(&conversation)?;
+        if restart_generation != self.state.generation {
+            return Err(EngineError::new(
+                EngineErrorCode::StaleRevision,
+                "Restart generation conflict.",
+            ));
+        }
+        let pending = self
+            .state
+            .pending
+            .iter()
+            .find(|entry| entry.receipt.id == command_id)
+            .ok_or_else(|| {
+                EngineError::new(EngineErrorCode::NotFound, "Queued command not found.")
+            })?;
+        match &pending.receipt.state {
+            CommandState::Held(HoldReason::TaskReview {
+                revision: held_rev, ..
+            }) => {
+                if held_rev != &revision {
+                    return Err(EngineError::new(
+                        EngineErrorCode::StaleRevision,
+                        "Task revision conflict.",
+                    ));
+                }
+            }
+            CommandState::Held(_) => {}
+            _ => {
+                return Err(EngineError::new(
+                    EngineErrorCode::InvalidCommand,
+                    "Command is not in a held state.",
+                ));
+            }
+        }
+        Ok(QueueContinuationPermit {
+            conversation,
+            revision,
+            command_id,
+            restart_generation,
+        })
+    }
+
+    pub fn resume_one(
+        &mut self,
+        permit: QueueContinuationPermit,
+    ) -> Result<CommandReceipt, EngineError> {
+        self.healthy()?;
+        self.owned(&permit.conversation)?;
+        if permit.restart_generation != self.state.generation {
+            return Err(EngineError::new(
+                EngineErrorCode::StaleRevision,
+                "Restart generation conflict.",
+            ));
+        }
+        let target_index = self
+            .state
+            .pending
+            .iter()
+            .position(|entry| entry.receipt.id == permit.command_id)
+            .ok_or_else(|| {
+                EngineError::new(EngineErrorCode::NotFound, "Queued command not found.")
+            })?;
+        let entry = &self.state.pending[target_index];
+        match &entry.receipt.state {
+            CommandState::Held(HoldReason::TaskReview { revision, .. }) => {
+                if revision != &permit.revision {
+                    return Err(EngineError::new(
+                        EngineErrorCode::StaleRevision,
+                        "Task revision conflict.",
+                    ));
+                }
+            }
+            CommandState::Held(_) => {}
+            _ => {
+                return Err(EngineError::new(
+                    EngineErrorCode::InvalidCommand,
+                    "Command is no longer held.",
+                ));
+            }
+        }
+        let mut state = self.state.clone();
+        state.revision = state.revision.checked_add(1).ok_or_else(corrupt)?;
+        state.advance_queue_revision()?;
+        let entry = &mut state.pending[target_index];
+        entry.receipt.status_revision = state.revision;
+        entry.receipt.state = CommandState::Accepted;
+        let updated_receipt = entry.receipt.clone();
+        self.commit(state)?;
+        Ok(updated_receipt)
+    }
+
+    pub fn record_intent(
+        &mut self,
+        intent: SideEffectIntent,
+    ) -> Result<SideEffectIntent, EngineError> {
+        self.healthy()?;
+        self.owned(&intent.conversation)?;
+        if self.state.intents.len() >= 32 {
+            return Err(EngineError::new(
+                EngineErrorCode::QueueFull,
+                "Maximum active side-effect intents reached.",
+            ));
+        }
+        if self.state.intents.iter().any(|i| i.id == intent.id) {
+            return Err(EngineError::new(
+                EngineErrorCode::IdentityConflict,
+                "Side-effect intent ID already exists.",
+            ));
+        }
+        let mut state = self.state.clone();
+        state.revision = state.revision.checked_add(1).ok_or_else(corrupt)?;
+        state.intents.push(intent.clone());
+        self.commit(state)?;
+        Ok(intent)
+    }
+
+    pub fn complete_intent(
+        &mut self,
+        intent_id: u64,
+        success: bool,
+    ) -> Result<SideEffectIntent, EngineError> {
+        self.healthy()?;
+        let pos = self
+            .state
+            .intents
+            .iter()
+            .position(|i| i.id == intent_id)
+            .ok_or_else(|| {
+                EngineError::new(EngineErrorCode::NotFound, "Side-effect intent not found.")
+            })?;
+        let mut state = self.state.clone();
+        state.revision = state.revision.checked_add(1).ok_or_else(corrupt)?;
+        state.intents[pos].state = IntentState::Completed { success };
+        let updated = state.intents[pos].clone();
+        self.commit(state)?;
+        Ok(updated)
     }
     fn fail(&self, point: &str) -> Result<(), EngineError> {
         #[cfg(test)]
@@ -863,7 +1502,7 @@ pub(crate) fn summary_from(
             CommandState::Held(hold) => Some(hold.clone()),
             _ => None,
         })
-        .or(Some(HoldReason::Paused));
+        .or(state.paused.then_some(HoldReason::Paused));
     Ok(ConversationSummary {
         conversation: ConversationId {
             root: state.root.clone(),

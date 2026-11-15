@@ -1862,3 +1862,515 @@ fn store_commit_succeeds_while_concurrent_reader_holds_history_json_open() {
     drop(reader);
     assert_eq!(store.receipt(&receipt.id).unwrap(), Some(receipt));
 }
+
+#[test]
+fn queue_cancel_and_replace_with_revision_conflict_checking() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = open(&dir);
+    let cmd_a = command("command A");
+    let receipt_a = store.submit(cmd_a.clone()).unwrap();
+    assert_eq!(receipt_a.state, CommandState::Accepted);
+
+    let queue = store.queue(&conversation()).unwrap();
+    let q_rev = queue.revision;
+
+    // Cancel with stale expected_queue_revision fails
+    let stale_cancel = EngineCommand {
+        id: CommandId::fresh(),
+        conversation: conversation(),
+        payload: CommandPayload::CancelQueued {
+            command_id: cmd_a.id.clone(),
+            expected_queue_revision: q_rev + 1,
+        },
+    };
+    assert_eq!(
+        store.submit(stale_cancel).unwrap_err().code,
+        EngineErrorCode::StaleRevision
+    );
+
+    // Cancel with correct revision succeeds
+    let cancel = EngineCommand {
+        id: CommandId::fresh(),
+        conversation: conversation(),
+        payload: CommandPayload::CancelQueued {
+            command_id: cmd_a.id.clone(),
+            expected_queue_revision: q_rev,
+        },
+    };
+    let cancel_receipt = store.submit(cancel).unwrap();
+    assert_eq!(
+        cancel_receipt.state,
+        CommandState::Finished {
+            run_id: None,
+            turn_id: None,
+            reason: CommandFinish::Applied,
+        }
+    );
+
+    // Command A is now CancelledBeforeStart
+    assert_eq!(
+        store.receipt(&cmd_a.id).unwrap().unwrap().state,
+        CommandState::Finished {
+            run_id: None,
+            turn_id: None,
+            reason: CommandFinish::CancelledBeforeStart,
+        }
+    );
+    assert_eq!(store.queue(&conversation()).unwrap().items.len(), 0);
+
+    // Submit command B
+    let cmd_b = command("command B");
+    store.submit(cmd_b.clone()).unwrap();
+    let q_rev2 = store.queue(&conversation()).unwrap().revision;
+
+    // Replace with stale revision fails
+    let cmd_c = command("command C (replacement)");
+    let stale_replace = EngineCommand {
+        id: CommandId::fresh(),
+        conversation: conversation(),
+        payload: CommandPayload::ReplaceQueued {
+            command_id: cmd_b.id.clone(),
+            expected_queue_revision: q_rev2 + 10,
+            replacement: Box::new(cmd_c.clone()),
+        },
+    };
+    assert_eq!(
+        store.submit(stale_replace).unwrap_err().code,
+        EngineErrorCode::StaleRevision
+    );
+
+    // Replace with correct revision succeeds
+    let replace = EngineCommand {
+        id: CommandId::fresh(),
+        conversation: conversation(),
+        payload: CommandPayload::ReplaceQueued {
+            command_id: cmd_b.id.clone(),
+            expected_queue_revision: q_rev2,
+            replacement: Box::new(cmd_c.clone()),
+        },
+    };
+    let replace_receipt = store.submit(replace).unwrap();
+    assert_eq!(
+        replace_receipt.state,
+        CommandState::Finished {
+            run_id: None,
+            turn_id: None,
+            reason: CommandFinish::Applied,
+        }
+    );
+
+    // Command B is superseded by Command C
+    assert_eq!(
+        store.receipt(&cmd_b.id).unwrap().unwrap().state,
+        CommandState::Finished {
+            run_id: None,
+            turn_id: None,
+            reason: CommandFinish::Superseded {
+                replacement: cmd_c.id.clone(),
+            },
+        }
+    );
+    // Command C is in queue and Accepted
+    assert_eq!(
+        store.receipt(&cmd_c.id).unwrap().unwrap().state,
+        CommandState::Accepted
+    );
+    assert_eq!(store.queue(&conversation()).unwrap().items.len(), 1);
+
+    // Reopen store: Command B remains Superseded
+    drop(store);
+    let store2 = open(&dir);
+    assert_eq!(
+        store2.receipt(&cmd_b.id).unwrap().unwrap().state,
+        CommandState::Finished {
+            run_id: None,
+            turn_id: None,
+            reason: CommandFinish::Superseded {
+                replacement: cmd_c.id.clone(),
+            },
+        }
+    );
+}
+
+#[test]
+fn queue_pause_and_resume_with_revision_and_generation_conflict() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = open(&dir);
+    let cmd = command("test command");
+    store.submit(cmd.clone()).unwrap();
+
+    let q_rev = store.queue(&conversation()).unwrap().revision;
+
+    // Pause with stale revision fails
+    let stale_pause = EngineCommand {
+        id: CommandId::fresh(),
+        conversation: conversation(),
+        payload: CommandPayload::PauseQueue {
+            expected_queue_revision: q_rev + 5,
+        },
+    };
+    assert_eq!(
+        store.submit(stale_pause).unwrap_err().code,
+        EngineErrorCode::StaleRevision
+    );
+
+    // Pause with valid revision succeeds
+    let pause = EngineCommand {
+        id: CommandId::fresh(),
+        conversation: conversation(),
+        payload: CommandPayload::PauseQueue {
+            expected_queue_revision: q_rev,
+        },
+    };
+    assert_eq!(
+        store.submit(pause).unwrap().state,
+        CommandState::Finished {
+            run_id: None,
+            turn_id: None,
+            reason: CommandFinish::Applied,
+        }
+    );
+    assert!(store.queue(&conversation()).unwrap().paused);
+
+    let q_rev2 = store.queue(&conversation()).unwrap().revision;
+    let generation = store.state.generation;
+
+    // Resume with wrong generation fails
+    let bad_gen_resume = EngineCommand {
+        id: CommandId::fresh(),
+        conversation: conversation(),
+        payload: CommandPayload::ResumeQueue {
+            expected_queue_revision: q_rev2,
+            restart_generation: generation + 99,
+        },
+    };
+    assert_eq!(
+        store.submit(bad_gen_resume).unwrap_err().code,
+        EngineErrorCode::StaleRevision
+    );
+
+    // Resume with valid revision and generation succeeds
+    let resume = EngineCommand {
+        id: CommandId::fresh(),
+        conversation: conversation(),
+        payload: CommandPayload::ResumeQueue {
+            expected_queue_revision: q_rev2,
+            restart_generation: generation,
+        },
+    };
+    assert_eq!(
+        store.submit(resume).unwrap().state,
+        CommandState::Finished {
+            run_id: None,
+            turn_id: None,
+            reason: CommandFinish::Applied,
+        }
+    );
+    assert!(!store.queue(&conversation()).unwrap().paused);
+}
+
+#[tokio::test]
+async fn queue_continuation_permit_issuance_and_consumption() {
+    let dir = tempfile::tempdir().unwrap();
+    let handle = open_acceptance_session(dir.path(), options()).unwrap();
+    let cmd = command("review hold command");
+    let cmd_id = cmd.id.clone();
+    let receipt = handle.commands.submit(cmd).await.unwrap();
+    assert_eq!(receipt.state, CommandState::Accepted);
+
+    let task_rev = TaskRevision {
+        turn_id: 1,
+        task_id: 1,
+        contract_revision: 2,
+        work_revision: 3,
+    };
+
+    // Simulate hold state for review
+    handle
+        .commands
+        .query({
+            let cmd_id = cmd_id.clone();
+            let task_rev = task_rev.clone();
+            move |store| {
+                let entry = store
+                    .state
+                    .pending
+                    .iter_mut()
+                    .find(|e| e.receipt.id == cmd_id)
+                    .unwrap();
+                entry.receipt.state = CommandState::Held(HoldReason::TaskReview {
+                    revision: task_rev,
+                    outcome: crate::TaskOutcome::NeedsReview,
+                });
+                Ok(())
+            }
+        })
+        .await
+        .unwrap();
+
+    let generation = handle
+        .commands
+        .query(|store| Ok(store.state.generation))
+        .await
+        .unwrap();
+
+    // Mismatched generation
+    let err = match handle
+        .commands
+        .confirm_queue_continuation(
+            conversation(),
+            task_rev.clone(),
+            cmd_id.clone(),
+            generation + 1,
+        )
+        .await
+    {
+        Err(e) => e,
+        Ok(_) => panic!("expected stale revision"),
+    };
+    assert_eq!(err.code, EngineErrorCode::StaleRevision);
+
+    // Mismatched task revision
+    let wrong_rev = TaskRevision {
+        turn_id: 1,
+        task_id: 1,
+        contract_revision: 99,
+        work_revision: 99,
+    };
+    let err = match handle
+        .commands
+        .confirm_queue_continuation(conversation(), wrong_rev, cmd_id.clone(), generation)
+        .await
+    {
+        Err(e) => e,
+        Ok(_) => panic!("expected stale revision"),
+    };
+    assert_eq!(err.code, EngineErrorCode::StaleRevision);
+
+    // Correct confirmation issues a permit
+    let permit = handle
+        .commands
+        .confirm_queue_continuation(conversation(), task_rev.clone(), cmd_id.clone(), generation)
+        .await
+        .unwrap();
+
+    // Consume permit to resume
+    let resumed_receipt = handle.commands.resume_one(permit).await.unwrap();
+    assert_eq!(resumed_receipt.state, CommandState::Accepted);
+
+    // Command in queue is now Accepted
+    let q = handle.commands.queue(&conversation()).await.unwrap();
+    assert_eq!(q.items[0].receipt.state, CommandState::Accepted);
+    handle.controls.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn side_effect_intent_recording_and_crash_recovery_barrier() {
+    let dir = tempfile::tempdir().unwrap();
+    let handle = open_acceptance_session(dir.path(), options()).unwrap();
+    let cmd = command("intent command");
+    let cmd_id = cmd.id.clone();
+    handle.commands.submit(cmd).await.unwrap();
+
+    let run_id = RunId::fresh();
+    let intent1 = SideEffectIntent {
+        id: 101,
+        command_id: cmd_id.clone(),
+        conversation: conversation(),
+        run_id: run_id.clone(),
+        call_id: "tool_call_1".into(),
+        effect: EffectClass::WorkspaceMutation,
+        argument_digest: Digest([1; 32]),
+        work_revision: 1,
+        state: IntentState::Dispatching,
+    };
+    let intent2 = SideEffectIntent {
+        id: 102,
+        command_id: cmd_id.clone(),
+        conversation: conversation(),
+        run_id: run_id.clone(),
+        call_id: "tool_call_2".into(),
+        effect: EffectClass::ExternalOrUnknown,
+        argument_digest: Digest([2; 32]),
+        work_revision: 1,
+        state: IntentState::Dispatching,
+    };
+
+    handle
+        .commands
+        .record_intent(intent1.clone())
+        .await
+        .unwrap();
+    handle
+        .commands
+        .record_intent(intent2.clone())
+        .await
+        .unwrap();
+
+    // Complete intent 1
+    let completed = handle.commands.complete_intent(101, true).await.unwrap();
+    assert_eq!(completed.state, IntentState::Completed { success: true });
+
+    // Mark command as Started
+    handle
+        .commands
+        .query({
+            let cmd_id = cmd_id.clone();
+            let run_id = run_id.clone();
+            move |store| {
+                let mut state = store.state.clone();
+                let entry = state
+                    .pending
+                    .iter_mut()
+                    .find(|e| e.receipt.id == cmd_id)
+                    .unwrap();
+                entry.receipt.state = CommandState::Started {
+                    run_id,
+                    turn_id: 1,
+                    safe_boundary_step: None,
+                };
+                store.commit(state)?;
+                Ok(())
+            }
+        })
+        .await
+        .unwrap();
+
+    handle.controls.shutdown().await.unwrap();
+
+    // Crash / Reopen: Dispatching intent 2 becomes Ambiguous, Started command becomes Held(AmbiguousEffects)
+    let store2 = open(&dir);
+    let int2 = store2.state.intents.iter().find(|i| i.id == 102).unwrap();
+    assert_eq!(int2.state, IntentState::Ambiguous);
+
+    let r = store2.receipt(&cmd_id).unwrap().unwrap();
+    assert_eq!(
+        r.state,
+        CommandState::Held(HoldReason::AmbiguousEffects {
+            run_id: run_id.clone(),
+            intent_ids: vec![102],
+        })
+    );
+}
+
+#[tokio::test]
+async fn control_client_stop_and_approval_routing() {
+    let dir = tempfile::tempdir().unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    let config = config_for(&dir, &workspace, "http://127.0.0.1:9999/v1".into());
+    struct DummyResolver;
+    impl TargetResolver for DummyResolver {
+        fn resolve(
+            &self,
+            target: ProviderTarget,
+        ) -> BoxFuture<Result<ResolvedTarget, EngineError>> {
+            Box::pin(async move {
+                Ok(ResolvedTarget::Native(Box::new(ResolvedNative {
+                    target: target.clone(),
+                    base_url: "http://127.0.0.1:9999/v1".into(),
+                    credential: crate::secrets::SecretBytes::new(b"secret".to_vec()).unwrap(),
+                    capabilities: ProviderCapabilities {
+                        target,
+                        safe_boundary_steering: FeatureSupport::Supported,
+                        stop_then_send: FeatureSupport::Supported,
+                        session_resume: FeatureSupport::Supported,
+                        prompt_images: FeatureSupport::Supported,
+                        rich_output: FeatureSupport::Supported,
+                        native_task_authority: FeatureSupport::Supported,
+                        shared_workspace_evidence: FeatureSupport::Supported,
+                        inherited_read_only: FeatureSupport::Supported,
+                        inherited_native_sandbox: FeatureSupport::Supported,
+                        portable_transfer: FeatureSupport::Supported,
+                        provider_native_fork: FeatureSupport::Supported,
+                        private_host_secret: FeatureSupport::Supported,
+                        history_retrieval_tool: FeatureSupport::Supported,
+                    },
+                })))
+            })
+        }
+    }
+    let handle = spawn_orchestrated_session(
+        config,
+        options(),
+        HostServices {
+            profiles: Arc::new(DummyResolver),
+            external: None,
+            pr_watch: None,
+            destinations: None,
+        },
+    )
+    .unwrap();
+
+    let run_a = RunId::fresh();
+    let run_b = RunId::fresh();
+    let conv_a = conversation();
+    let mut conv_b = conversation();
+    conv_b.root = SessionId::parse("child-session").unwrap();
+
+    let task_handle = TaskHandle {
+        conversation: conv_b.clone(),
+        command_id: CommandId::fresh(),
+    };
+
+    let flag_a = handle
+        .controls
+        .register_run(run_a.clone(), conv_a.clone(), None);
+    let flag_b =
+        handle
+            .controls
+            .register_run(run_b.clone(), conv_b.clone(), Some(task_handle.clone()));
+
+    assert!(!flag_a.load(Ordering::SeqCst));
+    assert!(!flag_b.load(Ordering::SeqCst));
+
+    // Scoped stop by Conversation A
+    let ack = handle
+        .controls
+        .stop(StopScope::Conversation(conv_a))
+        .await
+        .unwrap();
+    assert_eq!(ack.affected_runs, vec![run_a.clone()]);
+    assert!(flag_a.load(Ordering::SeqCst));
+    assert!(!flag_b.load(Ordering::SeqCst));
+
+    // Scoped stop by Task
+    let ack_b = handle
+        .controls
+        .stop(StopScope::Task(task_handle))
+        .await
+        .unwrap();
+    assert_eq!(ack_b.affected_runs, vec![run_b.clone()]);
+    assert!(flag_b.load(Ordering::SeqCst));
+
+    // Approval routing
+    let rx = handle
+        .controls
+        .register_approval(run_a.clone(), "call_99".into());
+    let approve_addr = ApprovalAddress {
+        conversation: conversation(),
+        run_id: run_a.clone(),
+        call_id: "call_99".into(),
+    };
+
+    // Approve delivery
+    handle
+        .controls
+        .approve(approve_addr.clone(), ApprovalDecision::Approve)
+        .await
+        .unwrap();
+    let decision = rx.await.unwrap();
+    assert_eq!(decision, ApprovalDecision::Approve);
+
+    // Second approve for same address fails (one-use)
+    assert_eq!(
+        handle
+            .controls
+            .approve(approve_addr, ApprovalDecision::Deny)
+            .await
+            .unwrap_err()
+            .code,
+        EngineErrorCode::NotFound
+    );
+
+    handle.controls.shutdown().await.unwrap();
+}

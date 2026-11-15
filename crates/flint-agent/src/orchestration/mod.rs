@@ -96,11 +96,24 @@ type Request = Box<dyn FnOnce(&mut store::Store) + Send>;
 pub struct CommandClient {
     tx: async_channel::Sender<Request>,
 }
+
+type ActiveRunEntry = (ConversationId, Option<TaskHandle>, Arc<AtomicBool>);
+
+#[derive(Default)]
+pub(crate) struct LiveControls {
+    pub(crate) active_runs: std::sync::Mutex<std::collections::HashMap<RunId, ActiveRunEntry>>,
+    pub(crate) pending_approvals: std::sync::Mutex<
+        std::collections::HashMap<(RunId, String), tokio::sync::oneshot::Sender<ApprovalDecision>>,
+    >,
+}
+
 #[derive(Clone)]
 pub struct ControlClient {
     commands: async_channel::Sender<Request>,
     stopping: Arc<AtomicBool>,
     done: tokio::sync::watch::Receiver<bool>,
+    live: Arc<LiveControls>,
+    acceptance_only: bool,
 }
 pub struct OrchestrationHandle {
     pub ops: async_channel::Sender<Op>,
@@ -210,18 +223,35 @@ impl CommandClient {
     }
     pub async fn confirm_queue_continuation(
         &self,
-        _: ConversationId,
-        _: TaskRevision,
-        _: CommandId,
-        _: u64,
+        conversation: ConversationId,
+        revision: TaskRevision,
+        command_id: CommandId,
+        restart_generation: u64,
     ) -> Result<QueueContinuationPermit, EngineError> {
-        Err(EngineError::unsupported())
+        self.query(move |store| {
+            store.confirm_queue_continuation(conversation, revision, command_id, restart_generation)
+        })
+        .await
     }
     pub async fn resume_one(
         &self,
-        _: QueueContinuationPermit,
+        permit: QueueContinuationPermit,
     ) -> Result<CommandReceipt, EngineError> {
-        Err(EngineError::unsupported())
+        self.query(move |store| store.resume_one(permit)).await
+    }
+    pub async fn record_intent(
+        &self,
+        intent: SideEffectIntent,
+    ) -> Result<SideEffectIntent, EngineError> {
+        self.query(move |store| store.record_intent(intent)).await
+    }
+    pub async fn complete_intent(
+        &self,
+        intent_id: u64,
+        success: bool,
+    ) -> Result<SideEffectIntent, EngineError> {
+        self.query(move |store| store.complete_intent(intent_id, success))
+            .await
     }
     pub async fn prepare_transfer(
         &self,
@@ -231,15 +261,94 @@ impl CommandClient {
     }
 }
 impl ControlClient {
-    pub async fn stop(&self, _: StopScope) -> Result<StopAck, EngineError> {
-        Err(EngineError::unsupported())
+    pub fn register_run(
+        &self,
+        run_id: RunId,
+        conversation: ConversationId,
+        task: Option<TaskHandle>,
+    ) -> Arc<AtomicBool> {
+        let flag = Arc::new(AtomicBool::new(false));
+        self.live
+            .active_runs
+            .lock()
+            .unwrap()
+            .insert(run_id, (conversation, task, flag.clone()));
+        flag
+    }
+
+    pub fn unregister_run(&self, run_id: &RunId) {
+        self.live.active_runs.lock().unwrap().remove(run_id);
+    }
+
+    pub fn register_approval(
+        &self,
+        run_id: RunId,
+        call_id: String,
+    ) -> tokio::sync::oneshot::Receiver<ApprovalDecision> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.live
+            .pending_approvals
+            .lock()
+            .unwrap()
+            .insert((run_id, call_id), tx);
+        rx
+    }
+
+    pub fn unregister_approval(&self, run_id: &RunId, call_id: &str) {
+        self.live
+            .pending_approvals
+            .lock()
+            .unwrap()
+            .remove(&(run_id.clone(), call_id.to_string()));
+    }
+
+    pub async fn stop(&self, scope: StopScope) -> Result<StopAck, EngineError> {
+        if self.acceptance_only && self.live.active_runs.lock().unwrap().is_empty() {
+            return Err(EngineError::unsupported());
+        }
+        let mut affected_runs = Vec::new();
+        let runs = self.live.active_runs.lock().unwrap();
+        for (run_id, (conv, task, flag)) in runs.iter() {
+            let matches = match &scope {
+                StopScope::Root => true,
+                StopScope::Conversation(target_conv) => conv == target_conv,
+                StopScope::Task(target_task) => task.as_ref() == Some(target_task),
+            };
+            if matches {
+                flag.store(true, Ordering::SeqCst);
+                affected_runs.push(run_id.clone());
+            }
+        }
+        Ok(StopAck {
+            scope,
+            affected_runs,
+            cancellation_requested: true,
+        })
     }
     pub async fn approve(
         &self,
-        _: ApprovalAddress,
-        _: ApprovalDecision,
+        address: ApprovalAddress,
+        decision: ApprovalDecision,
     ) -> Result<(), EngineError> {
-        Err(EngineError::unsupported())
+        if self.acceptance_only && self.live.pending_approvals.lock().unwrap().is_empty() {
+            return Err(EngineError::unsupported());
+        }
+        let sender = self
+            .live
+            .pending_approvals
+            .lock()
+            .unwrap()
+            .remove(&(address.run_id, address.call_id));
+        match sender {
+            Some(tx) => {
+                let _ = tx.send(decision);
+                Ok(())
+            }
+            None => Err(EngineError::new(
+                EngineErrorCode::NotFound,
+                "No pending approval for address.",
+            )),
+        }
     }
     pub async fn shutdown(&self) -> Result<(), EngineError> {
         self.stopping.store(true, Ordering::SeqCst);
@@ -268,7 +377,7 @@ pub fn spawn_orchestrated_session(
             "Durable acceptance requires a session directory.",
         )
     })?;
-    open_client(&dir, options)
+    open_client(&dir, options, false)
 }
 
 /// B1 storage entry point for hosts that intentionally do not start an executor.
@@ -276,11 +385,12 @@ pub fn open_acceptance_session(
     dir: &Path,
     options: OrchestrationOptions,
 ) -> Result<OrchestrationHandle, EngineError> {
-    open_client(dir, options)
+    open_client(dir, options, true)
 }
 fn open_client(
     dir: &Path,
     options: OrchestrationOptions,
+    acceptance_only: bool,
 ) -> Result<OrchestrationHandle, EngineError> {
     let inbox = options.limits.command_inbox;
     let store = store::Store::open(dir, options)?;
@@ -295,6 +405,14 @@ fn open_client(
     let stopping = Arc::new(AtomicBool::new(false));
     let stop = stopping.clone();
     let (finished, done) = tokio::sync::watch::channel(false);
+    let live = Arc::new(LiveControls::default());
+    let controls = ControlClient {
+        commands: tx.clone(),
+        stopping,
+        done,
+        live,
+        acceptance_only,
+    };
     std::thread::Builder::new()
         .name("flint-acceptance".into())
         .spawn(move || {
@@ -323,12 +441,8 @@ fn open_client(
         })?;
     Ok(OrchestrationHandle {
         ops,
-        commands: CommandClient { tx: tx.clone() },
-        controls: ControlClient {
-            commands: tx,
-            stopping,
-            done,
-        },
+        commands: CommandClient { tx },
+        controls,
         events,
         secrets: crate::secrets::SecretInbox { _private: () },
     })

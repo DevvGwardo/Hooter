@@ -366,7 +366,16 @@ pub struct ApprovalAddress {
 }
 
 pub struct QueueContinuationPermit {
-    pub(crate) _private: (),
+    pub(crate) conversation: ConversationId,
+    pub(crate) revision: TaskRevision,
+    pub(crate) command_id: CommandId,
+    pub(crate) restart_generation: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum IntentDecision {
+    Allow,
+    Deny { reason: String },
 }
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]

@@ -71,3 +71,8 @@ impl CommandId {
         Self(uuid::Uuid::new_v4().to_string())
     }
 }
+impl RunId {
+    pub fn fresh() -> Self {
+        Self(uuid::Uuid::new_v4().to_string())
+    }
+}
