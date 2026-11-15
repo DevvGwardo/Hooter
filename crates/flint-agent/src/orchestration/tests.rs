@@ -2374,3 +2374,494 @@ async fn control_client_stop_and_approval_routing() {
 
     handle.controls.shutdown().await.unwrap();
 }
+
+#[test]
+fn queue_cancel_started_command_or_unknown_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = open(&dir);
+    let cmd = command("to cancel");
+    let receipt = store.submit(cmd.clone()).unwrap();
+    assert_eq!(receipt.state, CommandState::Accepted);
+
+    let q_rev = store.queue(&conversation()).unwrap().revision;
+
+    // 1. Unknown command ID -> NotFound
+    let unknown_cancel = EngineCommand {
+        id: CommandId::fresh(),
+        conversation: conversation(),
+        payload: CommandPayload::CancelQueued {
+            command_id: CommandId::fresh(),
+            expected_queue_revision: q_rev,
+        },
+    };
+    assert_eq!(
+        store.submit(unknown_cancel).unwrap_err().code,
+        EngineErrorCode::NotFound
+    );
+
+    // 2. expected_queue_revision == 0 -> InvalidCommand
+    let zero_rev_cancel = EngineCommand {
+        id: CommandId::fresh(),
+        conversation: conversation(),
+        payload: CommandPayload::CancelQueued {
+            command_id: cmd.id.clone(),
+            expected_queue_revision: 0,
+        },
+    };
+    assert_eq!(
+        store.submit(zero_rev_cancel).unwrap_err().code,
+        EngineErrorCode::InvalidCommand
+    );
+
+    // 3. Mark command as Started, then attempt cancel -> InvalidCommand
+    store.state.pending[0].receipt.state = CommandState::Started {
+        run_id: RunId::fresh(),
+        turn_id: 1,
+        safe_boundary_step: None,
+    };
+    let started_cancel = EngineCommand {
+        id: CommandId::fresh(),
+        conversation: conversation(),
+        payload: CommandPayload::CancelQueued {
+            command_id: cmd.id.clone(),
+            expected_queue_revision: q_rev,
+        },
+    };
+    assert_eq!(
+        store.submit(started_cancel).unwrap_err().code,
+        EngineErrorCode::InvalidCommand
+    );
+}
+
+#[test]
+fn queue_replace_edge_cases_and_validations() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = open(&dir);
+    let cmd = command("original command");
+    store.submit(cmd.clone()).unwrap();
+
+    let q_rev = store.queue(&conversation()).unwrap().revision;
+
+    // 1. Unknown command ID -> NotFound
+    let unknown_replace = EngineCommand {
+        id: CommandId::fresh(),
+        conversation: conversation(),
+        payload: CommandPayload::ReplaceQueued {
+            command_id: CommandId::fresh(),
+            expected_queue_revision: q_rev,
+            replacement: Box::new(command("replacement")),
+        },
+    };
+    assert_eq!(
+        store.submit(unknown_replace).unwrap_err().code,
+        EngineErrorCode::NotFound
+    );
+
+    // 2. Replacement has same ID as target -> InvalidCommand
+    let same_id_cmd = EngineCommand {
+        id: cmd.id.clone(),
+        conversation: conversation(),
+        payload: CommandPayload::Send {
+            prompt: PromptSnapshot {
+                request: "same id".into(),
+                effective_text: "same id".into(),
+                images: Vec::new(),
+                citations: Vec::new(),
+            },
+            delivery: Delivery::NextTurn,
+        },
+    };
+    let same_id_replace = EngineCommand {
+        id: CommandId::fresh(),
+        conversation: conversation(),
+        payload: CommandPayload::ReplaceQueued {
+            command_id: cmd.id.clone(),
+            expected_queue_revision: q_rev,
+            replacement: Box::new(same_id_cmd),
+        },
+    };
+    assert_eq!(
+        store.submit(same_id_replace).unwrap_err().code,
+        EngineErrorCode::InvalidCommand
+    );
+
+    // 3. Replacement conversation mismatch -> InvalidCommand
+    let mut other_conv = conversation();
+    other_conv.root = SessionId::parse("other-root").unwrap();
+    let mut other_conv_cmd = command("other conv");
+    other_conv_cmd.conversation = other_conv;
+    let mismatch_conv_replace = EngineCommand {
+        id: CommandId::fresh(),
+        conversation: conversation(),
+        payload: CommandPayload::ReplaceQueued {
+            command_id: cmd.id.clone(),
+            expected_queue_revision: q_rev,
+            replacement: Box::new(other_conv_cmd),
+        },
+    };
+    assert_eq!(
+        store.submit(mismatch_conv_replace).unwrap_err().code,
+        EngineErrorCode::InvalidCommand
+    );
+
+    // 4. Replacement payload is nested control -> InvalidCommand
+    let nested_control_cmd = EngineCommand {
+        id: CommandId::fresh(),
+        conversation: conversation(),
+        payload: CommandPayload::PauseQueue {
+            expected_queue_revision: 1,
+        },
+    };
+    let nested_replace = EngineCommand {
+        id: CommandId::fresh(),
+        conversation: conversation(),
+        payload: CommandPayload::ReplaceQueued {
+            command_id: cmd.id.clone(),
+            expected_queue_revision: q_rev,
+            replacement: Box::new(nested_control_cmd),
+        },
+    };
+    assert_eq!(
+        store.submit(nested_replace).unwrap_err().code,
+        EngineErrorCode::InvalidCommand
+    );
+
+    // 5. Replacement ID collides with existing accepted command -> IdentityConflict
+    let second_cmd = command("second command");
+    store.submit(second_cmd.clone()).unwrap();
+    let q_rev2 = store.queue(&conversation()).unwrap().revision;
+
+    let colliding_replace = EngineCommand {
+        id: CommandId::fresh(),
+        conversation: conversation(),
+        payload: CommandPayload::ReplaceQueued {
+            command_id: cmd.id.clone(),
+            expected_queue_revision: q_rev2,
+            replacement: Box::new(second_cmd.clone()),
+        },
+    };
+    assert_eq!(
+        store.submit(colliding_replace).unwrap_err().code,
+        EngineErrorCode::IdentityConflict
+    );
+
+    // 6. Target command is actively Started -> InvalidCommand
+    store.state.pending[0].receipt.state = CommandState::Started {
+        run_id: RunId::fresh(),
+        turn_id: 1,
+        safe_boundary_step: None,
+    };
+    let started_replace = EngineCommand {
+        id: CommandId::fresh(),
+        conversation: conversation(),
+        payload: CommandPayload::ReplaceQueued {
+            command_id: cmd.id.clone(),
+            expected_queue_revision: q_rev2,
+            replacement: Box::new(command("new replace")),
+        },
+    };
+    assert_eq!(
+        store.submit(started_replace).unwrap_err().code,
+        EngineErrorCode::InvalidCommand
+    );
+}
+
+#[test]
+fn queue_pause_resume_unholds_paused_and_restart_commands() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = open(&dir);
+    let cmd1 = command("cmd 1");
+    let cmd2 = command("cmd 2");
+    store.submit(cmd1.clone()).unwrap();
+    store.submit(cmd2.clone()).unwrap();
+
+    let q_rev = store.queue(&conversation()).unwrap().revision;
+
+    // Pause queue
+    let pause = EngineCommand {
+        id: CommandId::fresh(),
+        conversation: conversation(),
+        payload: CommandPayload::PauseQueue {
+            expected_queue_revision: q_rev,
+        },
+    };
+    store.submit(pause).unwrap();
+
+    // Verify queue projection is paused and has HoldReason::Paused
+    let queue = store.queue(&conversation()).unwrap();
+    assert!(queue.paused);
+    assert_eq!(queue.hold, Some(HoldReason::Paused));
+
+    // Manually set cmd1 to Held(Paused) and cmd2 to Held(Restart)
+    let generation = store.state.generation;
+    store.state.pending[0].receipt.state = CommandState::Held(HoldReason::Paused);
+    store.state.pending[1].receipt.state = CommandState::Held(HoldReason::Restart { generation });
+
+    // Resume queue
+    let q_rev2 = store.queue(&conversation()).unwrap().revision;
+    let resume = EngineCommand {
+        id: CommandId::fresh(),
+        conversation: conversation(),
+        payload: CommandPayload::ResumeQueue {
+            expected_queue_revision: q_rev2,
+            restart_generation: generation,
+        },
+    };
+    store.submit(resume).unwrap();
+
+    // Both should now be Accepted
+    assert_eq!(store.state.pending[0].receipt.state, CommandState::Accepted);
+    assert_eq!(store.state.pending[1].receipt.state, CommandState::Accepted);
+    let queue2 = store.queue(&conversation()).unwrap();
+    assert!(!queue2.paused);
+    assert_eq!(queue2.hold, None);
+}
+
+#[test]
+fn side_effect_intent_limits_conflicts_and_not_found() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = open(&dir);
+    let cmd = command("intent cmd");
+    store.submit(cmd.clone()).unwrap();
+
+    let run_id = RunId::fresh();
+    let intent = SideEffectIntent {
+        id: 1,
+        command_id: cmd.id.clone(),
+        conversation: conversation(),
+        run_id: run_id.clone(),
+        call_id: "c1".into(),
+        effect: EffectClass::WorkspaceMutation,
+        argument_digest: Digest([0; 32]),
+        work_revision: 1,
+        state: IntentState::Dispatching,
+    };
+
+    // 1. Record intent succeeds
+    store.record_intent(intent.clone()).unwrap();
+
+    // 2. Duplicate intent ID -> IdentityConflict
+    assert_eq!(
+        store.record_intent(intent.clone()).unwrap_err().code,
+        EngineErrorCode::IdentityConflict
+    );
+
+    // 3. Complete nonexistent intent -> NotFound
+    assert_eq!(
+        store.complete_intent(999, true).unwrap_err().code,
+        EngineErrorCode::NotFound
+    );
+
+    // 4. Fill to 32 intents, 33rd fails with QueueFull
+    for i in 2..=32 {
+        let extra_intent = SideEffectIntent {
+            id: i,
+            command_id: cmd.id.clone(),
+            conversation: conversation(),
+            run_id: run_id.clone(),
+            call_id: format!("c{i}"),
+            effect: EffectClass::ReadOnly,
+            argument_digest: Digest([0; 32]),
+            work_revision: 1,
+            state: IntentState::Prepared,
+        };
+        store.record_intent(extra_intent).unwrap();
+    }
+    let overflow_intent = SideEffectIntent {
+        id: 33,
+        command_id: cmd.id.clone(),
+        conversation: conversation(),
+        run_id: run_id.clone(),
+        call_id: "c33".into(),
+        effect: EffectClass::ReadOnly,
+        argument_digest: Digest([0; 32]),
+        work_revision: 1,
+        state: IntentState::Prepared,
+    };
+    assert_eq!(
+        store.record_intent(overflow_intent).unwrap_err().code,
+        EngineErrorCode::QueueFull
+    );
+}
+
+#[tokio::test]
+async fn queue_continuation_permit_rejection_conditions() {
+    let dir = tempfile::tempdir().unwrap();
+    let handle = open_acceptance_session(dir.path(), options()).unwrap();
+    let cmd = command("permit test");
+    let cmd_id = cmd.id.clone();
+    handle.commands.submit(cmd).await.unwrap();
+
+    let task_rev = TaskRevision {
+        turn_id: 1,
+        task_id: 1,
+        contract_revision: 1,
+        work_revision: 1,
+    };
+    let generation = handle
+        .commands
+        .query(|s| Ok(s.state.generation))
+        .await
+        .unwrap();
+
+    // 1. Command is still Accepted (not Held) -> InvalidCommand
+    let err = match handle
+        .commands
+        .confirm_queue_continuation(conversation(), task_rev.clone(), cmd_id.clone(), generation)
+        .await
+    {
+        Err(e) => e,
+        Ok(_) => panic!("expected error"),
+    };
+    assert_eq!(err.code, EngineErrorCode::InvalidCommand);
+
+    // 2. Nonexistent command ID -> NotFound
+    let err = match handle
+        .commands
+        .confirm_queue_continuation(
+            conversation(),
+            task_rev.clone(),
+            CommandId::fresh(),
+            generation,
+        )
+        .await
+    {
+        Err(e) => e,
+        Ok(_) => panic!("expected error"),
+    };
+    assert_eq!(err.code, EngineErrorCode::NotFound);
+
+    // 3. Conversation not owned -> NotOwned
+    let mut unowned = conversation();
+    unowned.root = SessionId::parse("unowned-root").unwrap();
+    let err = match handle
+        .commands
+        .confirm_queue_continuation(unowned, task_rev.clone(), cmd_id.clone(), generation)
+        .await
+    {
+        Err(e) => e,
+        Ok(_) => panic!("expected error"),
+    };
+    assert_eq!(err.code, EngineErrorCode::NotOwned);
+
+    // 4. Put command in Held(TaskReview)
+    handle
+        .commands
+        .query({
+            let cmd_id = cmd_id.clone();
+            let task_rev = task_rev.clone();
+            move |s| {
+                let entry = s
+                    .state
+                    .pending
+                    .iter_mut()
+                    .find(|e| e.receipt.id == cmd_id)
+                    .unwrap();
+                entry.receipt.state = CommandState::Held(HoldReason::TaskReview {
+                    revision: task_rev,
+                    outcome: crate::TaskOutcome::NeedsReview,
+                });
+                Ok(())
+            }
+        })
+        .await
+        .unwrap();
+
+    let permit = handle
+        .commands
+        .confirm_queue_continuation(conversation(), task_rev, cmd_id.clone(), generation)
+        .await
+        .unwrap();
+
+    // Cancel the command before permit is consumed
+    let q_rev = handle
+        .commands
+        .queue(&conversation())
+        .await
+        .unwrap()
+        .revision;
+    let cancel = EngineCommand {
+        id: CommandId::fresh(),
+        conversation: conversation(),
+        payload: CommandPayload::CancelQueued {
+            command_id: cmd_id.clone(),
+            expected_queue_revision: q_rev,
+        },
+    };
+    handle.commands.submit(cancel).await.unwrap();
+
+    // Attempting resume_one on cancelled command -> NotFound
+    let err = handle.commands.resume_one(permit).await.unwrap_err();
+    assert_eq!(err.code, EngineErrorCode::NotFound);
+
+    handle.controls.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn control_client_stop_root_scope_cancels_all() {
+    let dir = tempfile::tempdir().unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    let config = config_for(&dir, &workspace, "http://127.0.0.1:9999/v1".into());
+    struct DummyResolver;
+    impl TargetResolver for DummyResolver {
+        fn resolve(
+            &self,
+            target: ProviderTarget,
+        ) -> BoxFuture<Result<ResolvedTarget, EngineError>> {
+            Box::pin(async move {
+                Ok(ResolvedTarget::Native(Box::new(ResolvedNative {
+                    target: target.clone(),
+                    base_url: "http://127.0.0.1:9999/v1".into(),
+                    credential: crate::secrets::SecretBytes::new(b"secret".to_vec()).unwrap(),
+                    capabilities: ProviderCapabilities {
+                        target,
+                        safe_boundary_steering: FeatureSupport::Supported,
+                        stop_then_send: FeatureSupport::Supported,
+                        session_resume: FeatureSupport::Supported,
+                        prompt_images: FeatureSupport::Supported,
+                        rich_output: FeatureSupport::Supported,
+                        native_task_authority: FeatureSupport::Supported,
+                        shared_workspace_evidence: FeatureSupport::Supported,
+                        inherited_read_only: FeatureSupport::Supported,
+                        inherited_native_sandbox: FeatureSupport::Supported,
+                        portable_transfer: FeatureSupport::Supported,
+                        provider_native_fork: FeatureSupport::Supported,
+                        private_host_secret: FeatureSupport::Supported,
+                        history_retrieval_tool: FeatureSupport::Supported,
+                    },
+                })))
+            })
+        }
+    }
+    let handle = spawn_orchestrated_session(
+        config,
+        options(),
+        HostServices {
+            profiles: Arc::new(DummyResolver),
+            external: None,
+            pr_watch: None,
+            destinations: None,
+        },
+    )
+    .unwrap();
+
+    let run1 = RunId::fresh();
+    let run2 = RunId::fresh();
+    let conv1 = conversation();
+    let mut conv2 = conversation();
+    conv2.root = SessionId::parse("root-2").unwrap();
+
+    let flag1 = handle.controls.register_run(run1.clone(), conv1, None);
+    let flag2 = handle.controls.register_run(run2.clone(), conv2, None);
+
+    assert!(!flag1.load(Ordering::SeqCst));
+    assert!(!flag2.load(Ordering::SeqCst));
+
+    let ack = handle.controls.stop(StopScope::Root).await.unwrap();
+    assert_eq!(ack.scope, StopScope::Root);
+    assert!(flag1.load(Ordering::SeqCst));
+    assert!(flag2.load(Ordering::SeqCst));
+    assert_eq!(ack.affected_runs.len(), 2);
+
+    handle.controls.shutdown().await.unwrap();
+}
