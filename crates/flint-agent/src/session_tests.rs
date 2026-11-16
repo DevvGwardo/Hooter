@@ -518,13 +518,7 @@ async fn valid_json_file_content_remains_a_string_through_the_harness() {
 #[tokio::test]
 async fn full_loop_writes_runs_and_finishes() {
     let (_guard, ws) = temp_workspace();
-    // `test`/`cat` are Unix shell builtins; the Windows runner checks the
-    // same content with the interpreter form used across task-engine tests.
-    let check: &str = if cfg!(windows) {
-        r#"python -c "import pathlib; assert pathlib.Path('a.txt').read_text()=='hi\n'""#
-    } else {
-        "test \"$(cat a.txt)\" = hi"
-    };
+    let check = task_engine_tests::exists_check(&ws, "a.txt");
     let expected_call = format!("call run_command {check}");
     let (url, requests) = mock_server(vec![
         sse_tool_call(
