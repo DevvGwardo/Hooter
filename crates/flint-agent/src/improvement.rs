@@ -1043,7 +1043,7 @@ fn private_directory_if_present(path: &Path) -> Result<(), Error> {
     }
     #[cfg(unix)]
     {
-        return private_metadata(&metadata);
+        private_metadata(&metadata)
     }
     #[cfg(windows)]
     {
@@ -1086,7 +1086,7 @@ fn private_file(lease: &WriterLease, name: &str, limit: usize) -> Result<(), Err
     #[cfg(unix)]
     {
         let metadata = file.metadata().map_err(|_| Error::Storage)?;
-        return private_metadata(&metadata);
+        private_metadata(&metadata)
     }
     #[cfg(windows)]
     {

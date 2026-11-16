@@ -4,6 +4,12 @@ use std::io::Write as _;
 pub(crate) fn run(cwd: &Path, args: &[&str]) -> Vec<u8> {
     let output = std::process::Command::new("git")
         .current_dir(cwd)
+        .envs([
+            ("GIT_AUTHOR_NAME", "Fixture"),
+            ("GIT_AUTHOR_EMAIL", "fixture@example.invalid"),
+            ("GIT_COMMITTER_NAME", "Fixture"),
+            ("GIT_COMMITTER_EMAIL", "fixture@example.invalid"),
+        ])
         .args(args)
         .output()
         .unwrap();

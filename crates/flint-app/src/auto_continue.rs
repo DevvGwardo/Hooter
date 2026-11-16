@@ -371,14 +371,14 @@ impl FlintApp {
 
     pub fn resume_automatic_task(&mut self, cx: &mut Context<Self>) {
         let ix = self.active;
-        if let Err(reason) = self.resume_automatic_task_in(ix, cx) {
-            if let Some(session) = self.sessions.get_mut(ix) {
-                session.auto_continue.pause(reason);
-                if let Some(panel) = &mut self.task_panel
-                    && panel.target.parent == session.uid
-                {
-                    panel.error = Some(reason.into());
-                }
+        if let Err(reason) = self.resume_automatic_task_in(ix, cx)
+            && let Some(session) = self.sessions.get_mut(ix)
+        {
+            session.auto_continue.pause(reason);
+            if let Some(panel) = &mut self.task_panel
+                && panel.target.parent == session.uid
+            {
+                panel.error = Some(reason.into());
             }
         }
         cx.notify();
