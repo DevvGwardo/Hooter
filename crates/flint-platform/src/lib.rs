@@ -135,20 +135,31 @@ pub fn relative_display(path: &Path) -> String {
 }
 
 fn executable_candidate(path: &Path, extensions: &[String]) -> Option<PathBuf> {
-    if path.is_file() {
-        return Some(on_disk(path).unwrap_or_else(|| path.to_path_buf()));
-    }
     if path.extension().is_some() {
-        return None;
-    }
-    extensions.iter().find_map(|extension| {
-        let mut candidate = path.as_os_str().to_os_string();
-        candidate.push(extension);
-        let candidate = PathBuf::from(candidate);
-        candidate
+        // An explicit suffix is taken as given.
+        return path
             .is_file()
-            .then(|| on_disk(&candidate).unwrap_or(candidate))
-    })
+            .then(|| on_disk(path).unwrap_or_else(|| path.to_path_buf()));
+    }
+    // Extensionless: on Windows, PATHEXT matches win over the bare file.
+    // npm's global bin dirs hold a `sh` shim under the tool's exact name that
+    // `Command::new` cannot execute ("%1 is not a valid Win32 application",
+    // os error 193), while the runnable `.cmd` / `.exe` sits beside it. Unix
+    // passes no extensions, so the extensionless file still wins there.
+    extensions
+        .iter()
+        .find_map(|extension| {
+            let mut candidate = path.as_os_str().to_os_string();
+            candidate.push(extension);
+            let candidate = PathBuf::from(candidate);
+            candidate
+                .is_file()
+                .then(|| on_disk(&candidate).unwrap_or(candidate))
+        })
+        .or_else(|| {
+            path.is_file()
+                .then(|| on_disk(path).unwrap_or_else(|| path.to_path_buf()))
+        })
 }
 
 /// The on-disk spelling of `candidate`. `PATHEXT` entries are usually
@@ -267,6 +278,33 @@ mod tests {
                 _ => None,
             }),
             Some(PathBuf::from(r"D:\Users\Alice"))
+        );
+    }
+
+    #[test]
+    fn npm_sh_shim_loses_to_a_pathext_match() {
+        let dir = tempfile::tempdir().unwrap();
+        // npm's global bin dir: an unspawnable `sh` shim under the tool's
+        // exact name plus the runnable `.cmd` beside it.
+        std::fs::write(dir.path().join("opencode"), "#!/bin/sh\n").unwrap();
+        std::fs::write(dir.path().join("opencode.cmd"), "").unwrap();
+        let extensions = vec![".exe".to_string(), ".cmd".to_string()];
+        assert_eq!(
+            executable_candidate(&dir.path().join("opencode"), &extensions),
+            Some(dir.path().join("opencode.cmd"))
+        );
+        // Without the shim the `.cmd` is still found...
+        std::fs::remove_file(dir.path().join("opencode")).unwrap();
+        assert_eq!(
+            executable_candidate(&dir.path().join("opencode"), &extensions),
+            Some(dir.path().join("opencode.cmd"))
+        );
+        // ...and with no PATHEXT match an extensionless file still resolves.
+        std::fs::remove_file(dir.path().join("opencode.cmd")).unwrap();
+        std::fs::write(dir.path().join("opencode"), "#!/bin/sh\n").unwrap();
+        assert_eq!(
+            executable_candidate(&dir.path().join("opencode"), &extensions),
+            Some(dir.path().join("opencode"))
         );
     }
 
