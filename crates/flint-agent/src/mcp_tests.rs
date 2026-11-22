@@ -36,12 +36,25 @@ for line in sys.stdin:
         pass  # our answer to roots/list
 "#;
 
+fn python_cmd() -> &'static str {
+    if cfg!(windows) {
+        let path = flint_platform::search_path(None);
+        if flint_platform::find_executable("python", &path).is_some() {
+            "python"
+        } else {
+            "py"
+        }
+    } else {
+        "python3"
+    }
+}
+
 fn config(name: &str, dir: &Path) -> McpServerConfig {
     let script = dir.join("server.py");
     std::fs::write(&script, SERVER).expect("script");
     McpServerConfig {
         name: name.to_string(),
-        command: if cfg!(windows) { "python" } else { "python3" }.into(),
+        command: python_cmd().into(),
         args: vec![script.display().to_string()],
         env: Vec::new(),
     }

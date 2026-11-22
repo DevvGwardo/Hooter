@@ -820,7 +820,14 @@ fn failed_native_scope_save_retains_the_draft_until_a_matching_acknowledgment(
     let (ui, engine) = finished_fixture(cx, TaskOutcome::NeedsReview);
     show_task(&ui, cx);
     ui.click(cx, "task-edit");
-    ui.press(cx, "cmd-a");
+    ui.press(
+        cx,
+        if cfg!(target_os = "macos") {
+            "cmd-a"
+        } else {
+            "ctrl-a"
+        },
+    );
     ui.input(cx, "Keep this objective after a failed save.");
     ui.click(cx, "task-edit-save");
     let sent = engine.sent();
@@ -860,7 +867,14 @@ fn failed_stopped_scope_save_keeps_edits_for_a_retry(cx: &mut TestAppContext) {
     std::fs::create_dir(&history).unwrap();
     show_task(&ui, cx);
     ui.click(cx, "task-edit");
-    ui.press(cx, "cmd-a");
+    ui.press(
+        cx,
+        if cfg!(target_os = "macos") {
+            "cmd-a"
+        } else {
+            "ctrl-a"
+        },
+    );
     ui.input(cx, "Retain this stopped scope draft.");
     ui.click(cx, "task-edit-save");
     settle(cx);

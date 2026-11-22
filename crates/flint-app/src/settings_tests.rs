@@ -3,6 +3,7 @@ use pretty_assertions::assert_eq;
 use super::KeySources;
 use super::KeyStatus;
 use super::Settings;
+use super::display_path;
 use super::jev_key_set;
 use super::key_with_typesafe_fallback;
 use flint_agent::ApprovalMode;
@@ -355,7 +356,7 @@ fn the_key_file_override_wins_and_is_trimmed() {
     assert_eq!(found.key, "sk-test");
     assert_eq!(
         settings.key_status(Some(&key), &KeySources::none()),
-        KeyStatus::Found(key.display().to_string())
+        KeyStatus::Found(display_path(&key))
     );
 }
 

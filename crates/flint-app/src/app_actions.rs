@@ -459,13 +459,21 @@ mod tests {
         ];
         args.extend(arguments.map(str::to_string));
         let mut view = SessionView::default();
+        let python =
+            if flint_platform::find_executable("python", &flint_platform::search_path(None))
+                .is_some()
+            {
+                "python"
+            } else {
+                "py"
+            };
         view.fold(
             flint_agent::AgentEvent::ToolCallStarted {
                 call_id: "replay".into(),
                 name: "execute".into(),
                 kind: flint_agent::ToolKind::Command,
                 summary: "literal argv".into(),
-                args: serde_json::json!({"command":"python","args":args}),
+                args: serde_json::json!({"command":python,"args":args}),
             },
             std::time::Duration::ZERO,
         );

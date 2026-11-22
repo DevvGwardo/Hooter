@@ -95,7 +95,15 @@ mod windows_tests {
 
     #[tokio::test]
     async fn windows_terminal_preserves_literal_argv_instead_of_shell_fallback() {
-        let request = CreateTerminalRequest::new("test", "python").args(vec![
+        let python =
+            if flint_platform::find_executable("python", &flint_platform::search_path(None))
+                .is_some()
+            {
+                "python"
+            } else {
+                "py"
+            };
+        let request = CreateTerminalRequest::new("test", python).args(vec![
             "-c".into(),
             "import sys; print(sys.argv[1])".into(),
             "literal & echo injected %PATH%".into(),

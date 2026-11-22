@@ -37,7 +37,7 @@ fn action(key: &RowKey, name: &str, start: usize) -> ElementId {
 }
 
 fn choose_width(ui: &Ui, cx: &mut TestAppContext, choice: usize) {
-    ui.press(cx, "cmd-,");
+    ui.press(cx, "secondary-,");
     paint(ui, cx);
     ui.click(cx, ("settings-chat-width", choice));
     ui.click(cx, "settings-save");
@@ -98,7 +98,7 @@ fn chat_width_settings_real_control_persists_and_reflows_without_reset(cx: &mut 
         (2, TranscriptWidth::Fill),
         (0, TranscriptWidth::Readable),
     ] {
-        ui.press(cx, "cmd-,");
+        ui.press(cx, "secondary-,");
         paint(&ui, cx);
         assert_eq!(
             cx.read(|cx| state.read(cx).selected_source_range()),
