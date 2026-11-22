@@ -1,4 +1,5 @@
 //! B1 durable acceptance foundation. No provider execution is enabled.
+pub(crate) mod children;
 mod contracts;
 #[cfg_attr(windows, path = "fs_windows.rs")]
 pub(crate) mod fs;
@@ -95,6 +96,10 @@ type Request = Box<dyn FnOnce(&mut store::Store) + Send>;
 #[derive(Clone)]
 pub struct CommandClient {
     tx: async_channel::Sender<Request>,
+    root: SessionId,
+    revision_rx: tokio::sync::watch::Receiver<u64>,
+    task_notify: Arc<tokio::sync::Notify>,
+    stopping: Arc<AtomicBool>,
 }
 
 type ActiveRunEntry = (ConversationId, Option<TaskHandle>, Arc<AtomicBool>);
@@ -124,7 +129,7 @@ pub struct OrchestrationHandle {
 }
 
 impl CommandClient {
-    async fn query<T: Send + 'static>(
+    pub(crate) async fn query<T: Send + 'static>(
         &self,
         action: impl FnOnce(&mut store::Store) -> Result<T, EngineError> + Send + 'static,
     ) -> Result<T, EngineError> {
@@ -215,11 +220,34 @@ impl CommandClient {
     pub async fn resolve_citation(&self, _: Citation) -> Result<HistoryExcerpt, EngineError> {
         Err(EngineError::unsupported())
     }
-    pub async fn task(&self, _: &TaskHandle) -> Result<TaskStatus, EngineError> {
-        Err(EngineError::unsupported())
+    pub async fn task(&self, handle: &TaskHandle) -> Result<TaskStatus, EngineError> {
+        children::task(self, handle).await
     }
-    pub async fn wait(&self, _: WaitRequest) -> Result<WaitResult, EngineError> {
-        Err(EngineError::unsupported())
+    pub async fn tasks(&self, handles: &[TaskHandle]) -> Result<Vec<TaskStatus>, EngineError> {
+        children::tasks(self, handles).await
+    }
+    pub async fn wait(&self, request: WaitRequest) -> Result<WaitResult, EngineError> {
+        children::wait(self, request).await
+    }
+    pub async fn update_task_status(
+        &self,
+        handle: &TaskHandle,
+        state: TaskRunState,
+    ) -> Result<TaskStatus, EngineError> {
+        let handle = handle.clone();
+        self.query(move |store| store.update_task_status(&handle, state)).await
+    }
+    pub(crate) fn root(&self) -> &SessionId {
+        &self.root
+    }
+    pub(crate) fn revision_watch(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.revision_rx.clone()
+    }
+    pub(crate) fn task_notify(&self) -> &Arc<tokio::sync::Notify> {
+        &self.task_notify
+    }
+    pub(crate) fn is_stopping(&self) -> bool {
+        self.stopping.load(Ordering::SeqCst)
     }
     pub async fn confirm_queue_continuation(
         &self,
@@ -393,7 +421,12 @@ fn open_client(
     acceptance_only: bool,
 ) -> Result<OrchestrationHandle, EngineError> {
     let inbox = options.limits.command_inbox;
-    let store = store::Store::open(dir, options)?;
+    let root_id = options.root_id.clone();
+    let mut store = store::Store::open(dir, options)?;
+    let (revision_tx, revision_rx) = tokio::sync::watch::channel(store.state.revision);
+    let task_notify = Arc::new(tokio::sync::Notify::new());
+    store.revision_tx = Some(revision_tx);
+    store.task_notify = Some(task_notify.clone());
     let (tx, rx) = async_channel::bounded::<Request>(inbox);
     let (ops, incoming_ops) = async_channel::bounded::<Op>(1);
     let (events_tx, events) = async_channel::bounded::<EngineEvent>(1);
@@ -408,10 +441,17 @@ fn open_client(
     let live = Arc::new(LiveControls::default());
     let controls = ControlClient {
         commands: tx.clone(),
-        stopping,
+        stopping: stopping.clone(),
         done,
         live,
         acceptance_only,
+    };
+    let commands = CommandClient {
+        tx,
+        root: root_id,
+        revision_rx,
+        task_notify,
+        stopping,
     };
     std::thread::Builder::new()
         .name("flint-acceptance".into())
@@ -441,7 +481,7 @@ fn open_client(
         })?;
     Ok(OrchestrationHandle {
         ops,
-        commands: CommandClient { tx },
+        commands,
         controls,
         events,
         secrets: crate::secrets::SecretInbox { _private: () },

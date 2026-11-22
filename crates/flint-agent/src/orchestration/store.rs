@@ -1,6 +1,6 @@
 use super::fs::{Directory, WriterLease};
 use super::*;
-use crate::{TaskOutcome, TaskRecord};
+use crate::{TaskOutcome, TaskRecord, TurnEndReason};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
@@ -39,6 +39,8 @@ pub(crate) struct State {
     pub intents: Vec<SideEffectIntent>,
     #[serde(default)]
     pub terminal_receipts: HashMap<CommandId, CommandReceipt>,
+    #[serde(default)]
+    pub tasks: Vec<TaskStatus>,
     #[serde(flatten)]
     pub extra: BTreeMap<String, Value>,
 }
@@ -77,6 +79,8 @@ pub(crate) struct Store {
     pub limits: EngineLimits,
     retained_index: HashMap<CommandId, CommandReceipt>,
     poisoned: bool,
+    pub(crate) revision_tx: Option<tokio::sync::watch::Sender<u64>>,
+    pub(crate) task_notify: Option<Arc<tokio::sync::Notify>>,
     #[cfg(test)]
     pub fault: Option<&'static str>,
 }
@@ -135,6 +139,31 @@ pub(crate) fn validate_intake(command: &EngineCommand) -> Result<(), EngineError
             prompt,
             delivery: Delivery::NextTurn,
         } => validate_prompt(prompt),
+        CommandPayload::StartChild(spec) => {
+            if command.conversation.child.is_some() {
+                return Err(EngineError::new(
+                    EngineErrorCode::InvalidCommand,
+                    "Child conversations cannot start children (single delegation level).",
+                ));
+            }
+            validate_prompt(&spec.prompt)?;
+            if spec.label.len() > 512 {
+                return Err(EngineError::new(
+                    EngineErrorCode::InvalidCommand,
+                    "Child label exceeds 512 bytes.",
+                ));
+            }
+            if spec.child.is_some() && spec.target.is_some() {
+                return Err(EngineError::new(
+                    EngineErrorCode::InvalidCommand,
+                    "Target override is not allowed when resuming an existing child.",
+                ));
+            }
+            if let Some(target) = &spec.target {
+                validate_target(target)?;
+            }
+            Ok(())
+        }
         CommandPayload::CancelQueued {
             expected_queue_revision,
             ..
@@ -272,6 +301,45 @@ pub(crate) fn validate_state(state: &State) -> Result<(), EngineError> {
         if intent.conversation.root != state.root {
             return Err(corrupt());
         }
+    }
+    if state.tasks.len() > 32 {
+        return Err(corrupt());
+    }
+    let active_tasks = state
+        .tasks
+        .iter()
+        .filter(|t| !matches!(t.state, TaskRunState::Finished { .. }))
+        .count();
+    if active_tasks > 4 {
+        return Err(corrupt());
+    }
+    let mut distinct_children = std::collections::HashSet::new();
+    let mut distinct_handles = Vec::with_capacity(state.tasks.len());
+    for task in &state.tasks {
+        if distinct_handles.contains(&task.handle) {
+            return Err(corrupt());
+        }
+        distinct_handles.push(task.handle.clone());
+        if task.handle.conversation.root != state.root {
+            return Err(corrupt());
+        }
+        let Some(child_id) = &task.handle.conversation.child else {
+            return Err(corrupt());
+        };
+        distinct_children.insert(child_id.clone());
+        if task.parent.root != state.root {
+            return Err(corrupt());
+        }
+        if task.revision == 0 || task.revision > state.revision {
+            return Err(corrupt());
+        }
+        if task.label.len() > 512 {
+            return Err(corrupt());
+        }
+        validate_target(&task.target).map_err(|_| corrupt())?;
+    }
+    if distinct_children.len() > 32 {
+        return Err(corrupt());
     }
     let mut bytes = 0usize;
     for (index, entry) in state.pending.iter().enumerate() {
@@ -444,6 +512,7 @@ impl Store {
                 paused: true,
                 intents: Vec::new(),
                 terminal_receipts: HashMap::new(),
+                tasks: Vec::new(),
                 extra: BTreeMap::new(),
             }
         };
@@ -462,6 +531,23 @@ impl Store {
                 "Saved queue exceeds the configured limits.",
             ));
         }
+        if state.tasks.len() > options.limits.retained_children {
+            return Err(EngineError::new(
+                EngineErrorCode::QueueFull,
+                "Saved retained children exceed configured limits.",
+            ));
+        }
+        let active_children = state
+            .tasks
+            .iter()
+            .filter(|t| !matches!(t.state, TaskRunState::Finished { .. }))
+            .count();
+        if active_children > options.limits.active_children {
+            return Err(EngineError::new(
+                EngineErrorCode::QueueFull,
+                "Saved active children exceed configured limits.",
+            ));
+        }
         let objects = lease.directory.child("engine-objects").map_err(storage)?;
         let mut store = Self {
             lease,
@@ -471,6 +557,8 @@ impl Store {
             limits: options.limits,
             retained_index: HashMap::new(),
             poisoned: false,
+            revision_tx: None,
+            task_notify: None,
             #[cfg(test)]
             fault: None,
         };
@@ -535,6 +623,14 @@ impl Store {
                     });
                 }
                 CommandState::Held(_) | CommandState::Finished { .. } => {}
+            }
+        }
+        for task in &mut state.tasks {
+            if matches!(task.state, TaskRunState::Queued) {
+                task.revision = state.revision;
+                task.state = TaskRunState::Held(HoldReason::Restart {
+                    generation: state.generation,
+                });
             }
         }
         store.commit(state)?;
@@ -703,6 +799,18 @@ impl Store {
                     .insert(command_id.clone(), cancelled_receipt.clone());
                 self.retained_index
                     .insert(command_id.clone(), cancelled_receipt);
+                if let Some(task) = state
+                    .tasks
+                    .iter_mut()
+                    .find(|t| &t.handle.command_id == command_id)
+                {
+                    task.revision = state.revision;
+                    task.state = TaskRunState::Finished {
+                        reason: TurnEndReason::Interrupted,
+                        outcome: TaskOutcome::Unknown,
+                        result_row: None,
+                    };
+                }
 
                 let control_receipt = CommandReceipt {
                     id: command.id.clone(),
@@ -912,6 +1020,12 @@ impl Store {
                 state.revision = state.revision.checked_add(1).ok_or_else(corrupt)?;
                 state.advance_queue_revision()?;
                 state.paused = true;
+                for task in &mut state.tasks {
+                    if matches!(task.state, TaskRunState::Queued) {
+                        task.revision = state.revision;
+                        task.state = TaskRunState::Held(HoldReason::Paused);
+                    }
+                }
 
                 let control_receipt = CommandReceipt {
                     id: command.id.clone(),
@@ -981,6 +1095,16 @@ impl Store {
                         pending.receipt.state = CommandState::Accepted;
                     }
                 }
+                for task in &mut state.tasks {
+                    if matches!(
+                        task.state,
+                        TaskRunState::Held(HoldReason::Paused)
+                            | TaskRunState::Held(HoldReason::Restart { .. })
+                    ) {
+                        task.revision = state.revision;
+                        task.state = TaskRunState::Queued;
+                    }
+                }
 
                 let control_receipt = CommandReceipt {
                     id: command.id.clone(),
@@ -1020,17 +1144,206 @@ impl Store {
                 self.commit(state)?;
                 Ok(control_receipt)
             }
+            CommandPayload::StartChild(spec) => {
+                let active_children = self
+                    .state
+                    .tasks
+                    .iter()
+                    .filter(|t| !matches!(t.state, TaskRunState::Finished { .. }))
+                    .count();
+                let distinct_children: std::collections::HashSet<ChildId> = self
+                    .state
+                    .tasks
+                    .iter()
+                    .filter_map(|t| t.handle.conversation.child.clone())
+                    .collect();
+
+                let (child_id, target) = if let Some(child_id) = &spec.child {
+                    if !distinct_children.contains(child_id) {
+                        return Err(EngineError::new(
+                            EngineErrorCode::NotFound,
+                            "Child not found.",
+                        ));
+                    }
+                    let is_active = self.state.tasks.iter().any(|t| {
+                        t.handle.conversation.child.as_ref() == Some(child_id)
+                            && !matches!(t.state, TaskRunState::Finished { .. })
+                    });
+                    if is_active {
+                        return Err(EngineError::new(
+                            EngineErrorCode::Busy,
+                            "Child is already active.",
+                        ));
+                    }
+                    if active_children >= self.limits.active_children {
+                        return Err(EngineError::new(
+                            EngineErrorCode::QueueFull,
+                            "Active children limit reached.",
+                        ));
+                    }
+                    if self.state.tasks.len() >= self.limits.retained_children {
+                        return Err(EngineError::new(
+                            EngineErrorCode::QueueFull,
+                            "Retained children limit reached.",
+                        ));
+                    }
+                    let target = self
+                        .state
+                        .tasks
+                        .iter()
+                        .find(|t| t.handle.conversation.child.as_ref() == Some(child_id))
+                        .unwrap()
+                        .target
+                        .clone();
+                    (child_id.clone(), target)
+                } else {
+                    if distinct_children.len() >= self.limits.retained_children {
+                        return Err(EngineError::new(
+                            EngineErrorCode::QueueFull,
+                            "Retained children limit reached.",
+                        ));
+                    }
+                    if active_children >= self.limits.active_children {
+                        return Err(EngineError::new(
+                            EngineErrorCode::QueueFull,
+                            "Active children limit reached.",
+                        ));
+                    }
+                    if self.state.tasks.len() >= self.limits.retained_children {
+                        return Err(EngineError::new(
+                            EngineErrorCode::QueueFull,
+                            "Retained children limit reached.",
+                        ));
+                    }
+                    let mut n = 1u64;
+                    let allocated = loop {
+                        let candidate = ChildId::parse(&format!("agent-{n}")).unwrap();
+                        if !distinct_children.contains(&candidate) {
+                            break candidate;
+                        }
+                        n = n.checked_add(1).ok_or_else(corrupt)?;
+                    };
+                    let target = spec
+                        .target
+                        .clone()
+                        .unwrap_or_else(|| self.state.target.clone());
+                    (allocated, target)
+                };
+
+                let child_conversation = ConversationId {
+                    root: self.state.root.clone(),
+                    child: Some(child_id),
+                };
+                let task_handle = TaskHandle {
+                    conversation: child_conversation,
+                    command_id: command.id.clone(),
+                };
+
+                if self.state.pending.len() >= self.limits.queued_commands
+                    || bytes.len().saturating_add(
+                        self.state
+                            .pending
+                            .iter()
+                            .map(|entry| entry.bytes)
+                            .sum::<usize>(),
+                    ) > self.limits.queued_bytes
+                {
+                    return Err(EngineError::new(
+                        EngineErrorCode::QueueFull,
+                        "Engine queue capacity reached.",
+                    ));
+                }
+
+                let mut state = self.state.clone();
+                state.revision = state.revision.checked_add(1).ok_or_else(corrupt)?;
+                state.advance_queue_revision()?;
+
+                let receipt = CommandReceipt {
+                    id: command.id.clone(),
+                    conversation: command.conversation.clone(),
+                    task: Some(task_handle.clone()),
+                    payload_digest,
+                    accepted_sequence: state.next_sequence,
+                    accepted_revision: state.revision,
+                    status_revision: state.revision,
+                    state: CommandState::Accepted,
+                };
+                state.next_sequence = state.next_sequence.checked_add(1).ok_or_else(corrupt)?;
+                state.receipt_count = state.receipt_count.checked_add(1).ok_or_else(corrupt)?;
+
+                let object = object_name(&bytes);
+                self.fail("object")?;
+                self.objects.immutable(&object, &bytes).map_err(storage)?;
+
+                let node = Node {
+                    version: 1,
+                    receipt: receipt.clone(),
+                    command_object: object.clone(),
+                    previous: state.receipt_head.clone(),
+                    ordinal: state.receipt_count,
+                };
+                let node_bytes = serde_json::to_vec(&node).map_err(|_| corrupt())?;
+                let node_name = object_name(&node_bytes);
+                self.fail("receipt")?;
+                self.objects
+                    .immutable(&node_name, &node_bytes)
+                    .map_err(storage)?;
+                state.receipt_head = Some(node_name.clone());
+
+                let preview: String = spec
+                    .prompt
+                    .request
+                    .chars()
+                    .scan(0usize, |size, ch| {
+                        *size += ch.len_utf8();
+                        (*size <= 512).then_some(ch)
+                    })
+                    .collect();
+                state.pending.push(Pending {
+                    receipt: receipt.clone(),
+                    object,
+                    acceptance: node_name,
+                    bytes: bytes.len(),
+                    preview,
+                });
+
+                let task_status = TaskStatus {
+                    handle: task_handle,
+                    target,
+                    parent: command.conversation.clone(),
+                    label: spec.label.clone(),
+                    revision: state.revision,
+                    state: TaskRunState::Queued,
+                };
+                state.tasks.push(task_status);
+
+                self.commit(state)?;
+                Ok(receipt)
+            }
             _ => Err(EngineError::unsupported()),
         }
     }
 
     pub fn owned(&self, conversation: &ConversationId) -> Result<(), EngineError> {
         self.healthy()?;
-        if conversation.root != self.state.root || conversation.child.is_some() {
+        if conversation.root != self.state.root {
             return Err(EngineError::new(
                 EngineErrorCode::NotOwned,
                 "Conversation is not owned by this B1 ledger.",
             ));
+        }
+        if let Some(child_id) = &conversation.child {
+            let is_known = self
+                .state
+                .tasks
+                .iter()
+                .any(|t| t.handle.conversation.child.as_ref() == Some(child_id));
+            if !is_known {
+                return Err(EngineError::new(
+                    EngineErrorCode::NotOwned,
+                    "Conversation is not owned by this B1 ledger.",
+                ));
+            }
         }
         Ok(())
     }
@@ -1074,8 +1387,10 @@ impl Store {
         {
             return Err(corrupt());
         }
-        let CommandPayload::Send { prompt, .. } = envelope.command.payload else {
-            return Err(corrupt());
+        let prompt = match envelope.command.payload {
+            CommandPayload::Send { prompt, .. } => prompt,
+            CommandPayload::StartChild(spec) => spec.prompt,
+            _ => return Err(corrupt()),
         };
         validate_prompt(&prompt).map_err(|_| corrupt())?;
         Ok(prompt)
@@ -1170,6 +1485,109 @@ impl Store {
         self.owned(conversation)?;
         summary_from(&self.document, &self.state)
     }
+
+    pub fn tasks(&self, handles: &[TaskHandle]) -> Result<Vec<TaskStatus>, EngineError> {
+        self.healthy()?;
+        let mut results = Vec::with_capacity(handles.len());
+        for handle in handles {
+            if handle.conversation.root != self.state.root {
+                return Err(EngineError::new(
+                    EngineErrorCode::NotOwned,
+                    "Task handle is not owned by this session.",
+                ));
+            }
+            let status = self
+                .state
+                .tasks
+                .iter()
+                .find(|t| &t.handle == handle)
+                .ok_or_else(|| {
+                    EngineError::new(EngineErrorCode::NotFound, "Task handle not found.")
+                })?;
+            results.push(status.clone());
+        }
+        Ok(results)
+    }
+
+    pub fn task(&self, handle: &TaskHandle) -> Result<TaskStatus, EngineError> {
+        let mut list = self.tasks(std::slice::from_ref(handle))?;
+        Ok(list.remove(0))
+    }
+
+    pub fn update_task_status(
+        &mut self,
+        handle: &TaskHandle,
+        new_state: TaskRunState,
+    ) -> Result<TaskStatus, EngineError> {
+        self.healthy()?;
+        if handle.conversation.root != self.state.root {
+            return Err(EngineError::new(
+                EngineErrorCode::NotOwned,
+                "Task handle is not owned by this session.",
+            ));
+        }
+        let pos = self
+            .state
+            .tasks
+            .iter()
+            .position(|t| &t.handle == handle)
+            .ok_or_else(|| {
+                EngineError::new(EngineErrorCode::NotFound, "Task handle not found.")
+            })?;
+        if matches!(self.state.tasks[pos].state, TaskRunState::Finished { .. }) {
+            return Err(EngineError::new(
+                EngineErrorCode::InvalidCommand,
+                "Cannot update a finished task.",
+            ));
+        }
+        let mut state = self.state.clone();
+        state.revision = state.revision.checked_add(1).ok_or_else(corrupt)?;
+        let task = &mut state.tasks[pos];
+        task.state = new_state.clone();
+        task.revision = state.revision;
+        let updated_task = task.clone();
+
+        if let Some(pending_pos) = state
+            .pending
+            .iter()
+            .position(|e| e.receipt.id == handle.command_id)
+        {
+            let mut entry = state.pending.remove(pending_pos);
+            entry.receipt.status_revision = state.revision;
+            match &new_state {
+                TaskRunState::Finished { reason, .. } => {
+                    entry.receipt.state = CommandState::Finished {
+                        run_id: None,
+                        turn_id: None,
+                        reason: CommandFinish::Executed(reason.clone()),
+                    };
+                    state
+                        .terminal_receipts
+                        .insert(handle.command_id.clone(), entry.receipt.clone());
+                    self.retained_index
+                        .insert(handle.command_id.clone(), entry.receipt);
+                }
+                TaskRunState::Running { run_id, turn_id } => {
+                    entry.receipt.state = CommandState::Started {
+                        run_id: run_id.clone(),
+                        turn_id: *turn_id,
+                        safe_boundary_step: None,
+                    };
+                    state.pending.insert(pending_pos, entry);
+                }
+                TaskRunState::Held(reason) => {
+                    entry.receipt.state = CommandState::Held(reason.clone());
+                    state.pending.insert(pending_pos, entry);
+                }
+                TaskRunState::Queued => {
+                    entry.receipt.state = CommandState::Accepted;
+                    state.pending.insert(pending_pos, entry);
+                }
+            }
+        }
+        self.commit(state)?;
+        Ok(updated_task)
+    }
     pub(crate) fn commit(&mut self, state: State) -> Result<(), EngineError> {
         if self.poisoned {
             return Err(storage(std::io::Error::other(
@@ -1226,6 +1644,12 @@ impl Store {
         }
         self.document = document;
         self.state = state;
+        if let Some(tx) = &self.revision_tx {
+            tx.send_replace(self.state.revision);
+        }
+        if let Some(notify) = &self.task_notify {
+            notify.notify_waiters();
+        }
         Ok(())
     }
 
