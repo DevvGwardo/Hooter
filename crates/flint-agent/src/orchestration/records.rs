@@ -1,9 +1,9 @@
 //! T3 Contract §4 & §7 records delivery, outbox acknowledgement, history pagination,
 //! citation excerpt extraction, and agent record loading.
 
+use super::EngineError;
 use super::contracts::*;
 use super::store::{self, ByteCounter, Store};
-use super::EngineError;
 use std::path::Path;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -82,10 +82,9 @@ pub(crate) fn paginate_records(
         .collect();
 
     let next_after_sequence = match cursor {
-        RecordCursor::After(after_seq) => page_records
-            .last()
-            .map(|r| r.sequence)
-            .unwrap_or(after_seq),
+        RecordCursor::After(after_seq) => {
+            page_records.last().map(|r| r.sequence).unwrap_or(after_seq)
+        }
         RecordCursor::Before(_) => page_records.last().map(|r| r.sequence).unwrap_or(0),
     };
 
@@ -113,9 +112,10 @@ pub(crate) fn acknowledge_records(store: &mut Store, sequence: u64) -> Result<()
     let mut state = store.state.clone();
     state.delivery_watermark = sequence;
     state.outbox.retain(|record| record.sequence > sequence);
-    state.revision = state.revision.checked_add(1).ok_or_else(|| {
-        EngineError::new(EngineErrorCode::CorruptState, "Revision overflow.")
-    })?;
+    state.revision = state
+        .revision
+        .checked_add(1)
+        .ok_or_else(|| EngineError::new(EngineErrorCode::CorruptState, "Revision overflow."))?;
     store.commit(state)?;
     Ok(())
 }
@@ -133,18 +133,21 @@ pub(crate) fn append_record(
             "Record sequence must be strictly increasing.",
         ));
     }
-    let next_seq = record.sequence.checked_add(1).ok_or_else(|| {
-        EngineError::new(EngineErrorCode::CorruptState, "Sequence overflow.")
-    })?;
+    let next_seq = record
+        .sequence
+        .checked_add(1)
+        .ok_or_else(|| EngineError::new(EngineErrorCode::CorruptState, "Sequence overflow."))?;
 
     // Check outbox byte budget
-    let record_bytes = serde_json::to_vec(&record).map_err(|_| {
-        EngineError::new(EngineErrorCode::CorruptState, "Cannot serialize record.")
-    })?;
+    let record_bytes = serde_json::to_vec(&record)
+        .map_err(|_| EngineError::new(EngineErrorCode::CorruptState, "Cannot serialize record."))?;
     let mut current_outbox_bytes: usize = 0;
     for item in &store.state.outbox {
         let b = serde_json::to_vec(item).map_err(|_| {
-            EngineError::new(EngineErrorCode::CorruptState, "Cannot serialize outbox record.")
+            EngineError::new(
+                EngineErrorCode::CorruptState,
+                "Cannot serialize outbox record.",
+            )
         })?;
         current_outbox_bytes = current_outbox_bytes.saturating_add(b.len());
     }
@@ -162,7 +165,10 @@ pub(crate) fn append_record(
         "record": &record,
     });
     let node_bytes = serde_json::to_vec(&node).map_err(|_| {
-        EngineError::new(EngineErrorCode::CorruptState, "Cannot serialize record node.")
+        EngineError::new(
+            EngineErrorCode::CorruptState,
+            "Cannot serialize record node.",
+        )
     })?;
     let node_obj = store::object_name(&node_bytes);
     store
@@ -172,9 +178,10 @@ pub(crate) fn append_record(
 
     let mut state = store.state.clone();
     state.next_sequence = next_seq;
-    state.revision = state.revision.checked_add(1).ok_or_else(|| {
-        EngineError::new(EngineErrorCode::CorruptState, "Revision overflow.")
-    })?;
+    state.revision = state
+        .revision
+        .checked_add(1)
+        .ok_or_else(|| EngineError::new(EngineErrorCode::CorruptState, "Revision overflow."))?;
     record.revision = state.revision;
     state.outbox.push(record.clone());
     state.transcript.push(record.clone());
@@ -567,13 +574,13 @@ pub fn write_asset(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::AgentEvent;
     use crate::orchestration::store::digest;
     use crate::orchestration::{
         CommandId, EngineErrorCode, OrchestrationOptions, ProfileRef, PromptDisplay,
         ProviderTarget, RowRole, SessionId,
     };
     use crate::rich::ContentRef;
-    use crate::AgentEvent;
 
     fn test_conversation() -> ConversationId {
         ConversationId {
@@ -1005,16 +1012,16 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
 
         // 1. Inline payload
-        let event = AgentEvent::TurnStarted {
-            turn_id: 42,
-        };
+        let event = AgentEvent::TurnStarted { turn_id: 42 };
         let inline_payload = AgentRecordPayload::Inline(Box::new(event.clone()));
         let resolved_inline = read_agent_record(dir.path(), &inline_payload, 1024).unwrap();
         assert_eq!(resolved_inline, event);
 
         // Inline oversized fails
         assert_eq!(
-            read_agent_record(dir.path(), &inline_payload, 5).unwrap_err().code,
+            read_agent_record(dir.path(), &inline_payload, 5)
+                .unwrap_err()
+                .code,
             EngineErrorCode::InvalidCommand
         );
 
@@ -1033,7 +1040,9 @@ mod tests {
 
         // Max bytes == 0 rejected
         assert_eq!(
-            read_agent_record(dir.path(), &stored_payload, 0).unwrap_err().code,
+            read_agent_record(dir.path(), &stored_payload, 0)
+                .unwrap_err()
+                .code,
             EngineErrorCode::InvalidCommand
         );
 

@@ -271,7 +271,8 @@ impl CommandClient {
         state: TaskRunState,
     ) -> Result<TaskStatus, EngineError> {
         let handle = handle.clone();
-        self.query(move |store| store.update_task_status(&handle, state)).await
+        self.query(move |store| store.update_task_status(&handle, state))
+            .await
     }
     pub(crate) fn root(&self) -> &SessionId {
         &self.root

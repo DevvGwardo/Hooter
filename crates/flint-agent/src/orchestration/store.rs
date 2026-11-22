@@ -247,9 +247,7 @@ pub(crate) fn validate_intake(command: &EngineCommand) -> Result<(), EngineError
             }
             Ok(())
         }
-        CommandPayload::Transfer(spec) => {
-            super::transfer::validate_transfer_intake(command, spec)
-        }
+        CommandPayload::Transfer(spec) => super::transfer::validate_transfer_intake(command, spec),
         _ => Err(EngineError::unsupported()),
     }
 }
@@ -1565,9 +1563,7 @@ impl Store {
             .tasks
             .iter()
             .position(|t| &t.handle == handle)
-            .ok_or_else(|| {
-                EngineError::new(EngineErrorCode::NotFound, "Task handle not found.")
-            })?;
+            .ok_or_else(|| EngineError::new(EngineErrorCode::NotFound, "Task handle not found."))?;
         if matches!(self.state.tasks[pos].state, TaskRunState::Finished { .. }) {
             return Err(EngineError::new(
                 EngineErrorCode::InvalidCommand,
@@ -1979,9 +1975,7 @@ impl Store {
                     serde_json::from_value(item.clone()).map_err(|_| corrupt())?;
                 let (role, text) = match msg {
                     crate::provider::Message::User(t) => (RowRole::User, t),
-                    crate::provider::Message::UserWithImages { text, .. } => {
-                        (RowRole::User, text)
-                    }
+                    crate::provider::Message::UserWithImages { text, .. } => (RowRole::User, text),
                     crate::provider::Message::Assistant { content, .. } => {
                         (RowRole::Assistant, content)
                     }

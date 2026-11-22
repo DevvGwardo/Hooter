@@ -1,8 +1,6 @@
 //! T3 Contract §7 & §9 context transfer, handoff and fork preview.
 
-use super::store::{
-    Store, corrupt, object_name, storage, validate_prompt, validate_target,
-};
+use super::store::{Store, corrupt, object_name, storage, validate_prompt, validate_target};
 use super::*;
 use crate::rich::ContentRef;
 use crate::{TaskContract, TaskMode, TaskRecord};
@@ -46,7 +44,8 @@ pub fn compute_transfer_digest(
         included_rows: included_rows.to_vec(),
         omitted: omitted.to_vec(),
     };
-    let bytes = serde_json::to_vec(&preimage).expect("TransferDigestPreimage serialization cannot fail");
+    let bytes =
+        serde_json::to_vec(&preimage).expect("TransferDigestPreimage serialization cannot fail");
     Digest(Sha256::digest(&bytes).into())
 }
 
@@ -57,20 +56,35 @@ pub fn estimate_tokens(chars: usize) -> u64 {
 
 /// Estimate tokens for a PromptSnapshot.
 pub fn estimate_prompt_tokens(prompt: &PromptSnapshot) -> u64 {
-    let text_tokens = estimate_tokens(prompt.request.len().saturating_add(prompt.effective_text.len()));
+    let text_tokens = estimate_tokens(
+        prompt
+            .request
+            .len()
+            .saturating_add(prompt.effective_text.len()),
+    );
     // Budget conservatively ~2,000 tokens per image attachment (8,000 char equiv).
     let image_tokens = (prompt.images.len() as u64).saturating_mul(2000);
     let citation_tokens = (prompt.citations.len() as u64).saturating_mul(10);
-    text_tokens.saturating_add(image_tokens).saturating_add(citation_tokens)
+    text_tokens
+        .saturating_add(image_tokens)
+        .saturating_add(citation_tokens)
 }
 
 /// Estimate UTF-8 byte size for a PromptSnapshot.
 pub fn estimate_prompt_bytes(prompt: &PromptSnapshot) -> usize {
-    let text_bytes = prompt.request.len().saturating_add(prompt.effective_text.len());
+    let text_bytes = prompt
+        .request
+        .len()
+        .saturating_add(prompt.effective_text.len());
     let images_bytes: usize = prompt
         .images
         .iter()
-        .map(|img| img.data.len().saturating_add(img.name.len()).saturating_add(img.mime_type.len()))
+        .map(|img| {
+            img.data
+                .len()
+                .saturating_add(img.name.len())
+                .saturating_add(img.mime_type.len())
+        })
         .sum();
     text_bytes.saturating_add(images_bytes)
 }
@@ -128,7 +142,10 @@ pub fn format_attributed_row(row: &HistoryRow) -> String {
         ContentRef::Inline(text) => text.as_str(),
         ContentRef::Asset(_asset) => "[stored asset ref]",
     };
-    format!("[Historical {role_str} from {target_str} (ordinal {})]\n{text}\n", row.id.ordinal)
+    format!(
+        "[Historical {role_str} from {target_str} (ordinal {})]\n{text}\n",
+        row.id.ordinal
+    )
 }
 
 /// Formats the full attributed history string from the included rows.
@@ -195,7 +212,8 @@ pub fn prepare_transfer(
 
     let task_opt = store.current_task_record()?;
     let scope_ref = task_opt.as_ref().map(|t| &t.contract);
-    let base_bytes = estimate_prompt_bytes(&spec.current).saturating_add(estimate_scope_bytes(scope_ref));
+    let base_bytes =
+        estimate_prompt_bytes(&spec.current).saturating_add(estimate_scope_bytes(scope_ref));
     if base_bytes > spec.budget.max_utf8_bytes {
         return Err(EngineError::new(
             EngineErrorCode::InvalidCommand,
@@ -203,9 +221,12 @@ pub fn prepare_transfer(
         ));
     }
 
-    let base_tokens = estimate_prompt_tokens(&spec.current).saturating_add(estimate_scope_tokens(scope_ref));
+    let base_tokens =
+        estimate_prompt_tokens(&spec.current).saturating_add(estimate_scope_tokens(scope_ref));
     let available_input_tokens = if spec.budget.reserve_output_tokens > 0 {
-        spec.budget.max_input_tokens.saturating_sub(spec.budget.reserve_output_tokens)
+        spec.budget
+            .max_input_tokens
+            .saturating_sub(spec.budget.reserve_output_tokens)
     } else {
         spec.budget.max_input_tokens
     };
@@ -225,7 +246,9 @@ pub fn prepare_transfer(
     candidate_rows.sort_by_key(|row| row.id.ordinal);
 
     if spec.through_row.ordinal > 0
-        && !candidate_rows.iter().any(|r| r.id.ordinal == spec.through_row.ordinal)
+        && !candidate_rows
+            .iter()
+            .any(|r| r.id.ordinal == spec.through_row.ordinal)
     {
         return Err(EngineError::new(
             EngineErrorCode::NotFound,
@@ -256,8 +279,10 @@ pub fn prepare_transfer(
 
     let included_slice = &candidate_rows[start_idx..];
     let included_row_ids: Vec<RowId> = included_slice.iter().map(|r| r.id.clone()).collect();
-    let final_bytes = base_bytes.saturating_add(included_slice.iter().map(row_bytes).sum::<usize>());
-    let final_tokens = base_tokens.saturating_add(included_slice.iter().map(row_tokens).sum::<u64>());
+    let final_bytes =
+        base_bytes.saturating_add(included_slice.iter().map(row_bytes).sum::<usize>());
+    let final_tokens =
+        base_tokens.saturating_add(included_slice.iter().map(row_tokens).sum::<u64>());
 
     let mut omitted = Vec::new();
     if start_idx > 0 && !candidate_rows.is_empty() {
@@ -356,13 +381,23 @@ pub fn execute_transfer(
     store.owned(&command.conversation)?;
 
     // Source must be idle: no started command, no in-flight side-effect dispatch
-    if store.state.pending.iter().any(|entry| matches!(entry.receipt.state, CommandState::Started { .. })) {
+    if store
+        .state
+        .pending
+        .iter()
+        .any(|entry| matches!(entry.receipt.state, CommandState::Started { .. }))
+    {
         return Err(EngineError::new(
             EngineErrorCode::Busy,
             "Cannot transfer while a command is actively running.",
         ));
     }
-    if store.state.intents.iter().any(|intent| matches!(intent.state, IntentState::Dispatching)) {
+    if store
+        .state
+        .intents
+        .iter()
+        .any(|intent| matches!(intent.state, IntentState::Dispatching))
+    {
         return Err(EngineError::new(
             EngineErrorCode::Busy,
             "Cannot transfer with ambiguous side-effects in dispatch.",
@@ -452,7 +487,10 @@ pub fn execute_transfer(
     let pkg_bytes = serde_json::to_vec(&package).map_err(|_| corrupt())?;
     let pkg_name = object_name(&pkg_bytes);
     store.fail("package")?;
-    store.objects.immutable(&pkg_name, &pkg_bytes).map_err(storage)?;
+    store
+        .objects
+        .immutable(&pkg_name, &pkg_bytes)
+        .map_err(storage)?;
 
     // Commit changes to state
     let mut state = store.state.clone();
@@ -511,10 +549,15 @@ pub fn execute_transfer(
     let node_bytes = serde_json::to_vec(&node).map_err(|_| corrupt())?;
     let node_name = object_name(&node_bytes);
     store.fail("receipt")?;
-    store.objects.immutable(&node_name, &node_bytes).map_err(storage)?;
+    store
+        .objects
+        .immutable(&node_name, &node_bytes)
+        .map_err(storage)?;
     state.receipt_head = Some(node_name);
 
-    store.retained_index.insert(command.id.clone(), control_receipt.clone());
+    store
+        .retained_index
+        .insert(command.id.clone(), control_receipt.clone());
     store.commit(state)?;
 
     Ok(control_receipt)
@@ -541,7 +584,10 @@ pub fn accept_transfer_into_destination(
     // Persist immutable package in destination objects
     let pkg_bytes = serde_json::to_vec(&package).map_err(|_| corrupt())?;
     let pkg_name = object_name(&pkg_bytes);
-    destination_store.objects.immutable(&pkg_name, &pkg_bytes).map_err(storage)?;
+    destination_store
+        .objects
+        .immutable(&pkg_name, &pkg_bytes)
+        .map_err(storage)?;
 
     let mut state = destination_store.state.clone();
     state.extra.insert(
@@ -560,7 +606,8 @@ pub fn accept_transfer_into_destination(
         0,
     );
     task_record.contract = package.inherited_scope.clone();
-    destination_store.document["task"] = serde_json::to_value(&task_record).map_err(|_| corrupt())?;
+    destination_store.document["task"] =
+        serde_json::to_value(&task_record).map_err(|_| corrupt())?;
 
     // Create held first command
     let first_command = EngineCommand {
@@ -574,7 +621,10 @@ pub fn accept_transfer_into_destination(
 
     let (cmd_bytes, cmd_digest) = super::store::canonical_command(&first_command)?;
     let cmd_obj = object_name(&cmd_bytes);
-    destination_store.objects.immutable(&cmd_obj, &cmd_bytes).map_err(storage)?;
+    destination_store
+        .objects
+        .immutable(&cmd_obj, &cmd_bytes)
+        .map_err(storage)?;
 
     state.revision = state.revision.checked_add(1).ok_or_else(corrupt)?;
     let hold_reason = package.inherited_hold.clone().unwrap_or(HoldReason::Paused);
@@ -602,10 +652,15 @@ pub fn accept_transfer_into_destination(
     };
     let node_bytes = serde_json::to_vec(&node).map_err(|_| corrupt())?;
     let node_name = object_name(&node_bytes);
-    destination_store.objects.immutable(&node_name, &node_bytes).map_err(storage)?;
+    destination_store
+        .objects
+        .immutable(&node_name, &node_bytes)
+        .map_err(storage)?;
     state.receipt_head = Some(node_name);
 
-    destination_store.retained_index.insert(first_command.id.clone(), first_receipt.clone());
+    destination_store
+        .retained_index
+        .insert(first_command.id.clone(), first_receipt.clone());
     destination_store.commit(state)?;
 
     Ok(DestinationAccepted {
@@ -739,7 +794,12 @@ mod tests {
         let conv = test_conv("root-source");
 
         for i in 1..=5 {
-            let row = sample_row(&conv, i, &format!("Historical transcript turn line {i}"), RowRole::User);
+            let row = sample_row(
+                &conv,
+                i,
+                &format!("Historical transcript turn line {i}"),
+                RowRole::User,
+            );
             store.record_history_row(row).unwrap();
         }
 
@@ -779,8 +839,16 @@ mod tests {
         assert!(!preview.omitted.is_empty());
         let omission = &preview.omitted[0];
         assert_eq!(omission.first_ordinal, 1);
-        assert_eq!(omission.last_ordinal, 5 - preview.included_rows.len() as u64);
-        assert!(preview.included_rows.iter().all(|r| r.ordinal > omission.last_ordinal));
+        assert_eq!(
+            omission.last_ordinal,
+            5 - preview.included_rows.len() as u64
+        );
+        assert!(
+            preview
+                .included_rows
+                .iter()
+                .all(|r| r.ordinal > omission.last_ordinal)
+        );
     }
 
     #[test]
@@ -818,7 +886,10 @@ mod tests {
 
         let err = prepare_transfer(&store, &spec).unwrap_err();
         assert_eq!(err.code, EngineErrorCode::InvalidCommand);
-        assert!(err.message.contains("Current request and host scope exceed"));
+        assert!(
+            err.message
+                .contains("Current request and host scope exceed")
+        );
     }
 
     #[test]
@@ -1136,22 +1207,29 @@ mod tests {
         assert!(store.state.paused, "Handoff must pause source store");
 
         // Immutable lineage and package must be persisted
-        let lineage: Lineage = serde_json::from_value(
-            store.state.extra.get("last_lineage").unwrap().clone(),
-        )
-        .unwrap();
+        let lineage: Lineage =
+            serde_json::from_value(store.state.extra.get("last_lineage").unwrap().clone()).unwrap();
         assert_eq!(lineage.source, conv);
         assert_eq!(lineage.mode, TransferMode::Handoff);
         assert_eq!(lineage.transfer_digest, preview.transfer_digest);
 
         let pkg_obj_name: String = serde_json::from_value(
-            store.state.extra.get("last_transfer_package").unwrap().clone(),
+            store
+                .state
+                .extra
+                .get("last_transfer_package")
+                .unwrap()
+                .clone(),
         )
         .unwrap();
         let pkg_bytes = store.objects.read(&pkg_obj_name, 1024 * 1024).unwrap();
         let package: TransferPackage = serde_json::from_slice(&pkg_bytes).unwrap();
         assert_eq!(package.current.request, "Resume feature build");
-        assert!(package.attributed_history.contains("User asked to build feature"));
+        assert!(
+            package
+                .attributed_history
+                .contains("User asked to build feature")
+        );
         assert_eq!(package.inherited_hold, Some(HoldReason::Paused));
 
         // Submitting same command again is idempotent
@@ -1384,10 +1462,18 @@ mod tests {
 
         let _ = source_store.submit(command).unwrap();
         let pkg_obj_name: String = serde_json::from_value(
-            source_store.state.extra.get("last_transfer_package").unwrap().clone(),
+            source_store
+                .state
+                .extra
+                .get("last_transfer_package")
+                .unwrap()
+                .clone(),
         )
         .unwrap();
-        let pkg_bytes = source_store.objects.read(&pkg_obj_name, 1024 * 1024).unwrap();
+        let pkg_bytes = source_store
+            .objects
+            .read(&pkg_obj_name, 1024 * 1024)
+            .unwrap();
         let package: TransferPackage = serde_json::from_slice(&pkg_bytes).unwrap();
 
         // Now open destination store
@@ -1396,11 +1482,17 @@ mod tests {
 
         let accepted = accept_transfer_into_destination(&mut dest_store, package).unwrap();
         assert_eq!(accepted.conversation.root.as_str(), "root-dest");
-        assert!(matches!(accepted.first_command.state, CommandState::Held(_)));
+        assert!(matches!(
+            accepted.first_command.state,
+            CommandState::Held(_)
+        ));
 
         // Check task was initialized with inherited scope
         let task_val = dest_store.document.get("task").unwrap();
         let task: TaskRecord = serde_json::from_value(task_val.clone()).unwrap();
-        assert_eq!(task.contract.original_request, "First user prompt in destination");
+        assert_eq!(
+            task.contract.original_request,
+            "First user prompt in destination"
+        );
     }
 }

@@ -149,7 +149,11 @@ mod tests {
         }
     }
 
-    fn child_spec(label: &str, child: Option<ChildId>, target: Option<ProviderTarget>) -> ChildSpec {
+    fn child_spec(
+        label: &str,
+        child: Option<ChildId>,
+        target: Option<ProviderTarget>,
+    ) -> ChildSpec {
         ChildSpec {
             label: label.into(),
             child,
@@ -268,10 +272,7 @@ mod tests {
         let cmd_resume = start_child_cmd("worker-step-2", Some(agent_1.clone()), None);
         let receipt_resume = client.submit(cmd_resume.clone()).await.unwrap();
         let task_handle_resume = receipt_resume.task.unwrap();
-        assert_eq!(
-            task_handle_resume.conversation.child,
-            Some(agent_1.clone())
-        );
+        assert_eq!(task_handle_resume.conversation.child, Some(agent_1.clone()));
         assert_eq!(task_handle_resume.command_id, cmd_resume.id);
 
         let status_resumed = client.task(&task_handle_resume).await.unwrap();
@@ -760,10 +761,11 @@ mod tests {
         assert!(!res.timed_out);
         assert!(elapsed >= std::time::Duration::from_millis(80));
         assert!(elapsed < std::time::Duration::from_millis(3000));
-        assert!(res
-            .statuses
-            .iter()
-            .all(|s| matches!(s.state, TaskRunState::Finished { .. })));
+        assert!(
+            res.statuses
+                .iter()
+                .all(|s| matches!(s.state, TaskRunState::Finished { .. }))
+        );
 
         handle.controls.shutdown().await.unwrap();
     }
