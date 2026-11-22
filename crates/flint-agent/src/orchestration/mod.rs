@@ -4,9 +4,11 @@ mod contracts;
 #[cfg_attr(windows, path = "fs_windows.rs")]
 pub(crate) mod fs;
 mod identity;
+pub(crate) mod records;
 pub(crate) mod store;
 #[cfg(test)]
 mod tests;
+pub(crate) mod transfer;
 
 use crate::watch::PrWatchSource;
 use crate::{AgentConfig, ApprovalDecision, Op};
@@ -96,6 +98,7 @@ type Request = Box<dyn FnOnce(&mut store::Store) + Send>;
 #[derive(Clone)]
 pub struct CommandClient {
     tx: async_channel::Sender<Request>,
+    pub(crate) acceptance_only: bool,
     root: SessionId,
     revision_rx: tokio::sync::watch::Receiver<u64>,
     task_notify: Arc<tokio::sync::Notify>,
@@ -198,11 +201,34 @@ impl CommandClient {
         let conversation = conversation.clone();
         self.query(move |store| store.summary(&conversation)).await
     }
-    pub async fn records(&self, _: u64, _: usize) -> Result<RecordPage, EngineError> {
-        Err(EngineError::unsupported())
+    pub async fn records(
+        &self,
+        after_sequence: u64,
+        limit: usize,
+    ) -> Result<RecordPage, EngineError> {
+        if self.acceptance_only {
+            return Err(EngineError::unsupported());
+        }
+        self.query(move |store| store.records(after_sequence, limit))
+            .await
     }
-    pub async fn acknowledge_records(&self, _: u64) -> Result<(), EngineError> {
-        Err(EngineError::unsupported())
+    pub async fn records_before(
+        &self,
+        before_sequence: Option<u64>,
+        limit: usize,
+    ) -> Result<RecordPage, EngineError> {
+        if self.acceptance_only {
+            return Err(EngineError::unsupported());
+        }
+        self.query(move |store| store.records_before(before_sequence, limit))
+            .await
+    }
+    pub async fn acknowledge_records(&self, through_sequence: u64) -> Result<(), EngineError> {
+        if self.acceptance_only {
+            return Err(EngineError::unsupported());
+        }
+        self.query(move |store| store.acknowledge_records(through_sequence))
+            .await
     }
     pub async fn history(&self, request: HistoryPageRequest) -> Result<HistoryPage, EngineError> {
         if request.limit == 0
@@ -215,10 +241,20 @@ impl CommandClient {
                 "History page exceeds its bounds.",
             ));
         }
-        Err(EngineError::unsupported())
+        if self.acceptance_only {
+            return Err(EngineError::unsupported());
+        }
+        self.query(move |store| store.history(request)).await
     }
-    pub async fn resolve_citation(&self, _: Citation) -> Result<HistoryExcerpt, EngineError> {
-        Err(EngineError::unsupported())
+    pub async fn resolve_citation(
+        &self,
+        citation: Citation,
+    ) -> Result<HistoryExcerpt, EngineError> {
+        if self.acceptance_only {
+            return Err(EngineError::unsupported());
+        }
+        self.query(move |store| store.resolve_citation(citation))
+            .await
     }
     pub async fn task(&self, handle: &TaskHandle) -> Result<TaskStatus, EngineError> {
         children::task(self, handle).await
@@ -283,9 +319,10 @@ impl CommandClient {
     }
     pub async fn prepare_transfer(
         &self,
-        _: &TransferPreviewSpec,
+        spec: &TransferPreviewSpec,
     ) -> Result<TransferPreview, EngineError> {
-        Err(EngineError::unsupported())
+        let spec = spec.clone();
+        self.query(move |store| store.prepare_transfer(&spec)).await
     }
 }
 impl ControlClient {
@@ -448,6 +485,7 @@ fn open_client(
     };
     let commands = CommandClient {
         tx,
+        acceptance_only,
         root: root_id,
         revision_rx,
         task_notify,
@@ -542,9 +580,25 @@ pub fn read_conversation_summary(dir: &Path) -> Result<Option<ConversationSummar
 }
 
 pub fn read_agent_record(
-    _: &Path,
-    _: &AgentRecordPayload,
-    _: usize,
+    path: &Path,
+    payload: &AgentRecordPayload,
+    max_bytes: usize,
 ) -> Result<crate::AgentEvent, EngineError> {
-    Err(EngineError::unsupported())
+    records::read_agent_record(path, payload, max_bytes)
+}
+
+pub fn read_asset(
+    path: &Path,
+    asset: &crate::rich::AssetRef,
+    max_bytes: usize,
+) -> Result<Vec<u8>, EngineError> {
+    records::read_asset(path, asset, max_bytes)
+}
+
+pub fn write_asset(
+    path: &Path,
+    mime_type: &str,
+    bytes: &[u8],
+) -> Result<crate::rich::AssetRef, EngineError> {
+    records::write_asset(path, mime_type, bytes)
 }

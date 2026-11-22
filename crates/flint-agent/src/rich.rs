@@ -2,13 +2,40 @@
 use crate::orchestration::*;
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct AssetId(String);
+pub struct AssetId(pub String);
+
+impl AssetId {
+    pub fn new(id: impl Into<String>) -> Self {
+        Self(id.into())
+    }
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for AssetId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct AssetRef {
     pub id: AssetId,
     pub mime_type: String,
     pub bytes: u64,
     pub digest: Digest,
+}
+
+impl AssetRef {
+    pub fn new(id: AssetId, mime_type: impl Into<String>, bytes: u64, digest: Digest) -> Self {
+        Self {
+            id,
+            mime_type: mime_type.into(),
+            bytes,
+            digest,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]

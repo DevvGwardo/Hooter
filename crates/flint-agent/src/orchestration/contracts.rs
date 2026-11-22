@@ -736,7 +736,7 @@ pub struct TransferPreview {
     pub capability_warnings: Vec<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct HistoryOmission {
     pub conversation: ConversationId,
     pub first_ordinal: u64,

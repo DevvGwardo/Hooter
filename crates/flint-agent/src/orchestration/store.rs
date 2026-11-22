@@ -41,6 +41,14 @@ pub(crate) struct State {
     pub terminal_receipts: HashMap<CommandId, CommandReceipt>,
     #[serde(default)]
     pub tasks: Vec<TaskStatus>,
+    #[serde(default)]
+    pub delivery_watermark: u64,
+    #[serde(default)]
+    pub outbox: Vec<EngineRecord>,
+    #[serde(default)]
+    pub history_rows: Vec<HistoryRow>,
+    #[serde(default)]
+    pub transcript: Vec<EngineRecord>,
     #[serde(flatten)]
     pub extra: BTreeMap<String, Value>,
 }
@@ -63,21 +71,21 @@ struct Envelope {
     command: EngineCommand,
 }
 #[derive(Serialize, Deserialize)]
-struct Node {
-    version: u32,
-    receipt: CommandReceipt,
-    command_object: String,
-    previous: Option<String>,
-    ordinal: u64,
+pub(crate) struct Node {
+    pub(crate) version: u32,
+    pub(crate) receipt: CommandReceipt,
+    pub(crate) command_object: String,
+    pub(crate) previous: Option<String>,
+    pub(crate) ordinal: u64,
 }
 
 pub(crate) struct Store {
     pub lease: WriterLease,
-    objects: Directory,
+    pub(crate) objects: Directory,
     pub document: Value,
     pub state: State,
     pub limits: EngineLimits,
-    retained_index: HashMap<CommandId, CommandReceipt>,
+    pub(crate) retained_index: HashMap<CommandId, CommandReceipt>,
     poisoned: bool,
     pub(crate) revision_tx: Option<tokio::sync::watch::Sender<u64>>,
     pub(crate) task_notify: Option<Arc<tokio::sync::Notify>>,
@@ -85,7 +93,7 @@ pub(crate) struct Store {
     pub fault: Option<&'static str>,
 }
 
-fn corrupt() -> EngineError {
+pub(crate) fn corrupt() -> EngineError {
     EngineError::new(
         EngineErrorCode::CorruptState,
         "Invalid saved orchestration. Existing history has been kept.",
@@ -100,13 +108,13 @@ pub(crate) fn storage(_: std::io::Error) -> EngineError {
 pub(crate) fn digest(bytes: &[u8]) -> Digest {
     Digest(Sha256::digest(bytes).into())
 }
-fn object_name(bytes: &[u8]) -> String {
+pub(crate) fn object_name(bytes: &[u8]) -> String {
     digest_name(&digest(bytes))
 }
-fn digest_name(digest: &Digest) -> String {
+pub(crate) fn digest_name(digest: &Digest) -> String {
     digest.to_hex()
 }
-fn valid_object(value: &str) -> bool {
+pub(crate) fn valid_object(value: &str) -> bool {
     value.len() == 64
         && value
             .bytes()
@@ -239,6 +247,9 @@ pub(crate) fn validate_intake(command: &EngineCommand) -> Result<(), EngineError
             }
             Ok(())
         }
+        CommandPayload::Transfer(spec) => {
+            super::transfer::validate_transfer_intake(command, spec)
+        }
         _ => Err(EngineError::unsupported()),
     }
 }
@@ -294,8 +305,24 @@ pub(crate) fn validate_state(state: &State) -> Result<(), EngineError> {
         || (state.receipt_head.is_none() != (state.receipt_count == 0))
         || state.intents.len() > 32
         || state.queue_revision.is_some_and(|rev| rev == 0)
+        || (state.delivery_watermark > 0 && state.delivery_watermark >= state.next_sequence)
     {
         return Err(corrupt());
+    }
+    for record in &state.outbox {
+        if record.sequence <= state.delivery_watermark || record.sequence >= state.next_sequence {
+            return Err(corrupt());
+        }
+    }
+    for row in &state.history_rows {
+        if row.id.ordinal == 0 || row.id.conversation.root != state.root {
+            return Err(corrupt());
+        }
+    }
+    for record in &state.transcript {
+        if record.sequence == 0 || record.sequence >= state.next_sequence {
+            return Err(corrupt());
+        }
     }
     for intent in &state.intents {
         if intent.conversation.root != state.root {
@@ -454,7 +481,7 @@ pub(crate) fn validate_lineage(directory: &Directory, state: &State) -> Result<(
 }
 
 /// Counts serialized bytes without allocating a buffer.
-struct ByteCounter(usize);
+pub(crate) struct ByteCounter(pub usize);
 impl std::io::Write for ByteCounter {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         self.0 += buf.len();
@@ -513,6 +540,10 @@ impl Store {
                 intents: Vec::new(),
                 terminal_receipts: HashMap::new(),
                 tasks: Vec::new(),
+                delivery_watermark: 0,
+                outbox: Vec::new(),
+                history_rows: Vec::new(),
+                transcript: Vec::new(),
                 extra: BTreeMap::new(),
             }
         };
@@ -1320,6 +1351,9 @@ impl Store {
                 self.commit(state)?;
                 Ok(receipt)
             }
+            CommandPayload::Transfer(spec) => {
+                super::transfer::execute_transfer(self, &command, &bytes, payload_digest, spec)
+            }
             _ => Err(EngineError::unsupported()),
         }
     }
@@ -1797,12 +1831,201 @@ impl Store {
         self.commit(state)?;
         Ok(updated)
     }
-    fn fail(&self, point: &str) -> Result<(), EngineError> {
+    pub(crate) fn fail(&self, point: &str) -> Result<(), EngineError> {
         #[cfg(test)]
         if self.fault == Some(point) {
             return Err(storage(std::io::Error::other("injected")));
         }
         let _ = point;
+        Ok(())
+    }
+
+    pub fn records(&self, after_sequence: u64, limit: usize) -> Result<RecordPage, EngineError> {
+        self.healthy()?;
+        super::records::records(self, after_sequence, limit)
+    }
+
+    pub fn records_before(
+        &self,
+        before_sequence: Option<u64>,
+        limit: usize,
+    ) -> Result<RecordPage, EngineError> {
+        self.healthy()?;
+        super::records::records_before(self, before_sequence, limit)
+    }
+
+    pub fn acknowledge_records(&mut self, sequence: u64) -> Result<(), EngineError> {
+        self.healthy()?;
+        super::records::acknowledge_records(self, sequence)
+    }
+
+    pub fn history(&self, request: HistoryPageRequest) -> Result<HistoryPage, EngineError> {
+        self.healthy()?;
+        super::records::history(self, request)
+    }
+
+    pub fn resolve_citation(&self, citation: Citation) -> Result<HistoryExcerpt, EngineError> {
+        self.healthy()?;
+        super::records::resolve_citation(self, citation)
+    }
+
+    #[allow(dead_code)]
+    pub fn append_record(&mut self, record: EngineRecord) -> Result<EngineRecord, EngineError> {
+        self.healthy()?;
+        super::records::append_record(self, record)
+    }
+
+    #[allow(dead_code)]
+    pub fn append_history_row(&mut self, row: HistoryRow) -> Result<(), EngineError> {
+        self.healthy()?;
+        super::records::append_history_row(self, row)
+    }
+
+    pub fn objects_dir(&self) -> &Directory {
+        &self.objects
+    }
+
+    pub fn prepare_transfer(
+        &self,
+        spec: &TransferPreviewSpec,
+    ) -> Result<TransferPreview, EngineError> {
+        super::transfer::prepare_transfer(self, spec)
+    }
+
+    pub fn current_task_revision(&self) -> Result<TaskRevision, EngineError> {
+        let turn_id = self
+            .document
+            .get("turn_id")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        if let Some(task_val) = self.document.get("task").filter(|v| !v.is_null()) {
+            let task: TaskRecord =
+                serde_json::from_value(task_val.clone()).map_err(|_| corrupt())?;
+            Ok(TaskRevision {
+                turn_id,
+                task_id: task.contract.id,
+                contract_revision: task.contract.revision,
+                work_revision: task.work_revision,
+            })
+        } else {
+            Ok(TaskRevision {
+                turn_id,
+                task_id: 0,
+                contract_revision: 0,
+                work_revision: 0,
+            })
+        }
+    }
+
+    pub fn current_task_record(&self) -> Result<Option<TaskRecord>, EngineError> {
+        if let Some(task_val) = self.document.get("task").filter(|v| !v.is_null()) {
+            let task: TaskRecord =
+                serde_json::from_value(task_val.clone()).map_err(|_| corrupt())?;
+            Ok(Some(task))
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub fn current_hold(&self) -> Option<HoldReason> {
+        self.state
+            .pending
+            .iter()
+            .find_map(|entry| match &entry.receipt.state {
+                CommandState::Held(hold) => Some(hold.clone()),
+                _ => None,
+            })
+            .or(self.state.paused.then_some(HoldReason::Paused))
+    }
+
+    pub fn load_history_rows(
+        &self,
+        conversation: &ConversationId,
+    ) -> Result<Vec<HistoryRow>, EngineError> {
+        if !self.state.history_rows.is_empty() {
+            let mut rows: Vec<HistoryRow> = self
+                .state
+                .history_rows
+                .iter()
+                .filter(|r| r.id.conversation == *conversation)
+                .cloned()
+                .collect();
+            rows.sort_by_key(|r| r.id.ordinal);
+            return Ok(rows);
+        }
+
+        if let Some(rows_val) = self.document.get("rows").and_then(|v| v.as_array()) {
+            let mut rows = Vec::new();
+            for item in rows_val {
+                let row: HistoryRow =
+                    serde_json::from_value(item.clone()).map_err(|_| corrupt())?;
+                if row.id.conversation == *conversation {
+                    rows.push(row);
+                }
+            }
+            rows.sort_by_key(|r| r.id.ordinal);
+            return Ok(rows);
+        }
+
+        if let Some(msgs_val) = self.document.get("messages").and_then(|v| v.as_array()) {
+            let turn_id = self
+                .document
+                .get("turn_id")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            let mut rows = Vec::new();
+            for (idx, item) in msgs_val.iter().enumerate() {
+                let msg: crate::provider::Message =
+                    serde_json::from_value(item.clone()).map_err(|_| corrupt())?;
+                let (role, text) = match msg {
+                    crate::provider::Message::User(t) => (RowRole::User, t),
+                    crate::provider::Message::UserWithImages { text, .. } => {
+                        (RowRole::User, text)
+                    }
+                    crate::provider::Message::Assistant { content, .. } => {
+                        (RowRole::Assistant, content)
+                    }
+                    crate::provider::Message::System(t)
+                    | crate::provider::Message::TaskContext(t)
+                    | crate::provider::Message::Nudge(t)
+                    | crate::provider::Message::Summary(t) => (RowRole::SystemNotice, t),
+                    _ => (RowRole::Tool, String::new()),
+                };
+                let content_digest = digest(text.as_bytes());
+                rows.push(HistoryRow {
+                    id: RowId {
+                        conversation: conversation.clone(),
+                        ordinal: (idx + 1) as u64,
+                    },
+                    turn_id,
+                    role,
+                    source_target: self.state.target.clone(),
+                    content: crate::rich::ContentRef::Inline(text),
+                    content_digest,
+                    citations: Vec::new(),
+                    truncated: false,
+                });
+            }
+            return Ok(rows);
+        }
+
+        Ok(Vec::new())
+    }
+
+    #[allow(dead_code)]
+    pub fn record_history_row(&mut self, row: HistoryRow) -> Result<(), EngineError> {
+        let mut state = self.state.clone();
+        let rows_val = self
+            .document
+            .as_object_mut()
+            .ok_or_else(corrupt)?
+            .entry("rows".to_string())
+            .or_insert_with(|| json!([]));
+        if let Some(arr) = rows_val.as_array_mut() {
+            arr.push(serde_json::to_value(&row).map_err(|_| corrupt())?);
+        }
+        state.revision = state.revision.checked_add(1).ok_or_else(corrupt)?;
+        self.commit(state)?;
         Ok(())
     }
 }
@@ -1866,7 +2089,7 @@ fn validate_limits(limits: &EngineLimits) -> Result<(), EngineError> {
     }
     Ok(())
 }
-fn validate_prompt(prompt: &PromptSnapshot) -> Result<(), EngineError> {
+pub(crate) fn validate_prompt(prompt: &PromptSnapshot) -> Result<(), EngineError> {
     let bytes = prompt.images.iter().fold(
         prompt
             .request
@@ -1934,8 +2157,7 @@ pub(crate) fn summary_from(
         },
         title: None,
         target: state.target.clone(),
-        // B1 creates acceptance receipts, not engine event records.
-        last_record_sequence: 0,
+        last_record_sequence: state.transcript.last().map_or(0, |record| record.sequence),
         snapshot_revision: state.revision,
         last_turn_id: document["turn_id"].as_u64().ok_or_else(corrupt)?,
         running: false,
