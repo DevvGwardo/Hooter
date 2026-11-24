@@ -92,8 +92,8 @@ def main():
     intro = ("Direct Bun checks now count as verification; output-masking wrappers do not. "
              "Analysis-only requests leave files unchanged. The new live pilot confirmed Bun "
              "recovery paths but stopped at its conservative budget, so incomplete trials stay visible."
-             if workflow else "A contained Gemini subscription pilot reproduced completion friction "
-             "even with the judge off. The recovered-invocation fix now passes a replay of the exact "
+             if workflow else "A contained Gemini subscription pilot reproduced completion friction. "
+             "The recovered-invocation fix now passes a replay of the exact "
              "failing task snapshot.")
     workflow_section = ""
     if workflow:
@@ -190,7 +190,7 @@ a causal A/B result. The saved failing task snapshot supplies the deterministic 
 <h2>Earlier pilot limits and quota</h2><p>Historical cumulative budget debit: {budget['calls']:,} calls,
 {budget['charged_tokens']:,} tokens, including the conservative routing-probe debit.
 Only Antigravity Gemini subscription routing was requested. No paid fallback was authorized.
-Exact billing is unavailable. The Gemini judge is experimental, not calibrated Typesafe JEV.</p>
+Exact billing is unavailable.</p>
 <p>B1 durable acceptance does not execute provider jobs. This tests native sessions and subagents.
 One Rust test remains ignored. Native UI was not rerun in that historical pass.
 Current scoped UI evidence, when supplied, is shown above. Other-platform runtime checks remain untested.</p>

@@ -25,7 +25,7 @@ from orchestrator_cases import CASES, fixture_digest
 from orchestrator_proxy import Budget, Proxy, local_url, omniroute_credentials
 
 REPO = Path(__file__).resolve().parents[2]
-VARIANTS = ("single", "delegated", "delegated-gemini-judge")
+VARIANTS = ("single", "delegated")
 SANDBOX = Path("/usr/bin/sandbox-exec")
 BUN = Path(shutil.which("bun") or "/missing-bun").resolve()
 TYPESCRIPT_LIB = Path(os.environ.get("HOOTER_EVAL_TYPESCRIPT_LIB", "/missing-typescript")).resolve()
@@ -435,7 +435,7 @@ def run_case(case, variant, trial, out, bridge, budget, args, credentials):
     spec = {"workspace": str(workspace), "base_url": proxy.base_url,
             "model": proxy.model, "proxy_key": proxy.key, "prompt": case.prompt,
             "allow_subagents": variant != "single",
-            "judge": variant == "delegated-gemini-judge", "timeout_secs": args.run_seconds,
+            "timeout_secs": args.run_seconds,
             "denied_read_canary": str(out / "containment/private-canary")}
     try:
         process = execute(
@@ -529,10 +529,6 @@ def summarize(results):
             "deliverable_tasks": len(delivered),
             "false_completions": sum(row["score"]["false_completion"] for row in rows),
             "provider_calls": sum(len(row["proxy"]["requests"]) for row in rows),
-            "judge_calls": sum(request["kind"] == "gemini-judge" for row in rows
-                               for request in row["proxy"]["requests"]),
-            "judge_failures": sum(request["kind"] == "gemini-judge" and request["status"] != "ok"
-                                  for row in rows for request in row["proxy"]["requests"]),
             "nudges": sum(row["metrics"]["counts"].get("HarnessNudge", 0) for row in rows),
             "approval_requests": sum(row["metrics"]["counts"].get("ApprovalRequested", 0) for row in rows),
             "subagents": sum(row["delegation_observed"] for row in rows),
@@ -567,7 +563,7 @@ def render_report(report, out):
             variant, f"{values['scenario_passed']}/{values['scenarios']}",
             f"{values['deliverables_verified']}/{values['deliverable_tasks']}",
             values["artifacts_passed"], values["artifacts_held_by_host"],
-            values["false_completions"], values["provider_calls"], values["judge_calls"],
+            values["false_completions"], values["provider_calls"],
             round(values["median_seconds"], 2) if values["median_seconds"] is not None else "n/a"
         )) + "</tr>")
     page = f"""<!doctype html><html lang="en"><meta charset="utf-8">
@@ -585,8 +581,8 @@ summary{{cursor:pointer}}.table{{overflow:auto}}
 </style><h1>{title}</h1><p>{mode} · {counts}/{len(report['results'])} scenarios passed</p>
 <div class="note"><strong>Evidence limits</strong><p>Offline passes prove the harness and native
 tool/event paths, not model quality. Correctly reporting a missing dependency is a scenario pass,
-not a shipped deliverable. The Gemini judge is experimental, not Typesafe JEV. Neither a
-Completed turn nor a judge verdict is acceptance. Exact billed cost is not inferred from token counts.
+not a shipped deliverable. Neither a Completed turn nor a self-reported
+outcome is acceptance. Exact billed cost is not inferred from token counts.
 This small pilot is not statistically conclusive.</p></div>
 <h2>Checks</h2><table><thead><tr><th>Promise</th><th>Result</th></tr></thead>
 <tbody>{checks}</tbody></table>
@@ -595,7 +591,7 @@ This small pilot is not statistically conclusive.</p></div>
 <h2>Comparison</h2><div class="table"><table><thead><tr>
 <th>Variant</th><th>Scenarios</th><th>Verified deliverables</th>
 <th>Artifacts passed</th><th>Host-held artifacts</th><th>False assessments</th>
-<th>Calls</th><th>Judge calls</th><th>Median seconds</th></tr></thead>
+<th>Calls</th><th>Median seconds</th></tr></thead>
 <tbody>{''.join(summary)}</tbody></table></div>
 <h2>Scenarios</h2><div style="overflow:auto"><table><thead><tr>
 <th>Task</th><th>Variant</th><th>Trial</th><th>Result</th><th>Host outcome</th>
@@ -660,7 +656,6 @@ def main(argv=None):
                        f"orchestrator-{int(time.time())}-{uuid.uuid4().hex[:8]}")
     frozen = source_fingerprint()
     report = {"version": 1, "live": args.live, "model": args.model if args.live else "offline-scripted",
-              "judge": "experimental Gemini adapter, not Typesafe JEV",
               "source_sha256": frozen, "fixture_sha256": fixture_digest(),
               "bridge_sha256": hashlib.sha256(bridge.read_bytes()).hexdigest(),
               "sandbox": "verified supervisor OS containment; no nested sandbox-exec",
@@ -746,7 +741,7 @@ def main(argv=None):
             report["checks"].append({"name": "Pinned Bun and TypeScript stayed unchanged",
                                     "passed": runtime_identity() == runtime_receipt})
         report["budget"] = budget.snapshot()
-        report["checks"].append({"name": "Combined parent/child/judge call and token budgets respected",
+        report["checks"].append({"name": "Combined parent/child call and token budgets respected",
                                  "passed": report["budget"]["calls"] <= args.max_calls and
                                  report["budget"]["charged_tokens"] +
                                  report["budget"]["pending_reserved_tokens"] <= args.max_tokens})

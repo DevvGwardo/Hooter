@@ -110,45 +110,6 @@ fn coastal_home_preserves_the_composer_setup_action_and_compact_layout(cx: &mut 
 }
 
 #[gpui_kit::test]
-fn jev_composer_toggle_remains_reachable_and_persists_in_compact_windows(cx: &mut TestAppContext) {
-    let fixture = Fixture::open(cx);
-    cx.simulate_window_resize(fixture.window, size(px(900.), px(560.)));
-    settle(cx);
-    fixture.with(cx, |window, cx| {
-        window.render_frame(cx);
-        window.scroll(
-            "composer-options",
-            gpui_kit::ScrollDelta::Pixels(gpui_kit::point(px(0.), px(-160.))),
-            cx,
-        );
-    });
-    settle(cx);
-    fixture.with(cx, |window, cx| {
-        window.render_frame(cx);
-        let options = window.find("composer-options").bounds();
-        let toggle = window.find("jev-toggle").bounds();
-        assert!(toggle.top() >= options.top() && toggle.bottom() <= options.bottom());
-        assert!(toggle.left() >= options.left() && toggle.right() <= options.right());
-        window.click("jev-toggle", cx);
-    });
-    assert!(!cx.read(|cx| fixture.app.read(cx).settings.jev_judge));
-    assert!(
-        !flint_app::settings::Settings::load(fixture._home.path(), &KeySources::none()).jev_judge
-    );
-    fixture.press(cx, "secondary-,");
-    assert!(!cx.read(|cx| {
-        fixture
-            .app
-            .read(cx)
-            .settings_form
-            .as_ref()
-            .unwrap()
-            .jev_judge
-    }));
-    fixture.press(cx, "escape");
-}
-
-#[gpui_kit::test]
 fn native_primary_shortcuts_open_sessions_settings_and_changes(cx: &mut TestAppContext) {
     let fixture = Fixture::open(cx);
     assert_eq!(cx.read(|cx| fixture.app.read(cx).sessions.len()), 1);

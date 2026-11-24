@@ -1,8 +1,7 @@
 # Informational blocker recovery
 
 A native turn ending normally is not evidence that its task succeeded. Agent
-blocker reports remain recorded until explicitly resolved; a JEV verdict never
-clears them or accepts work.
+blocker reports remain recorded until explicitly resolved.
 
 ## Before stopping
 
@@ -15,19 +14,13 @@ The recovery check does not run for work tasks, observed edits, explicit require
 files/checks, tool failures, scope denials, user-review/child blockers, incomplete
 evidence, or independent-review feedback. Those obstacles remain protected.
 
-When enabled and configured, JEV answers `blocker_recovery`: whether another
-permitted inspection could make progress. It receives bounded task, blocker,
-recent-tool, inspection, and available-tool context. A probability of at least
-0.6 advises recovery. A lower probability leaves the blocker in place. An
-unavailable judge, timeout, exhausted judge budget, or disabled JEV uses the
-same conservative one-follow-up heuristic. Existing approvals, tool scope,
-sandboxing, and the JEV request/time limits are unchanged.
-
-A failed judgment opens a per-turn circuit breaker: later checks use their
-deterministic fallbacks instead of repeatedly calling the unavailable service.
-A new turn can try JEV again. Finish judgments are also skipped once the
-four-follow-up budget is exhausted; midturn loop judgments remain available.
-Neither optimization clears a blocker or turns missing verification into success.
+The deterministic `blocker_recovery` rule decides whether another permitted
+inspection could make progress. It applies only to informational tasks whose
+only blockers are agent reports, with no denied scope, failed tool, child
+report, evidence overflow or independent review; otherwise the blocker stays in
+place. The follow-up fires at most once per turn and shares the four-follow-up
+budget. Existing approvals, tool scope and sandboxing are unchanged. Recovery
+never clears a blocker or turns missing verification into success.
 
 ## Resolving a claim
 
@@ -61,7 +54,6 @@ answers must state what the inspected sources actually establish.
 
 ```sh
 FLINT_LIVE=0 FLINT_EVAL=0 FLINT_BENCH=0 cargo test --offline --locked -p flint-agent
-cargo test --offline --locked -p flint-app --test blueprint_ui jev_ -- --test-threads=1
 ```
 
 The agent regressions use scripted loopback inference and disposable files,

@@ -31,7 +31,6 @@ fn config(url: String, workspace: &Path) -> AgentConfig {
         "bench".to_string(),
     );
     config.approval = ApprovalMode::Auto;
-    config.jev = None;
     config
 }
 

@@ -426,50 +426,6 @@ pub fn render(app: &FlintApp, window: &Window, cx: &mut Context<FlintApp>) -> An
                 )
             },
         )
-        .when(app.session().agent == AgentKind::Flint, |bar| {
-            let enabled = app.settings.jev_judge;
-            let key_set = crate::settings::jev_key_set(&app.key_sources);
-            let color = if enabled && key_set {
-                p.accent
-            } else {
-                p.text_subtle
-            };
-            let status = if !enabled {
-                "Off: the harness uses its own heuristics."
-            } else if key_set {
-                "On: a TypeSafe credential is available."
-            } else {
-                "On, waiting for TYPESAFE_API_KEY or $FLINT_HOME/keys/typesafe.key."
-            };
-            bar.child(
-                chip("jev-toggle")
-                    .role(Role::Switch)
-                    .aria_label(format!("JEV judge. Applies on the next native turn. {status}"))
-                    .aria_toggled(if enabled {
-                        Toggled::True
-                    } else {
-                        Toggled::False
-                    })
-                    .on_click(cx.listener(|this, _, _, cx| this.toggle_jev_judge(cx)))
-                    .tooltip(move |window, cx| {
-                        gpui_kit::component::tooltip::Tooltip::new(format!(
-                            "{status} Changes apply on the next turn in native sessions, including existing engines. Edit permissions and completion checks stay active; external agents use their own guardrails."
-                        ))
-                        .build(window, cx)
-                    })
-                    .child(ui::icon(IconName::CircleCheck, 14., color))
-                    .child(ui::label(
-                        if enabled {
-                            "JEV: On"
-                        } else {
-                            "JEV: Off"
-                        },
-                        size::SM,
-                        color,
-                    ))
-                    .test_support(),
-            )
-        })
         .when(app.session().agent == AgentKind::Flint && !compact, |bar| {
             let enabled = app.settings.auto_continue_fixes;
             let paused = app.session().auto_continue.paused_reason;

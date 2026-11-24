@@ -65,18 +65,18 @@ The legacy `crates/flint-agent/tests/eval.rs` now:
 - Waits up to 30 seconds for `SessionStopped { history_saved: true }` before
   grading. Unverified shutdown skips grading, records failure, and retains its
   temporary workspace rather than deleting potentially active artifacts.
-- Reports independent artifact results, shutdown status, host assessment, and
-  successful JEV verdicts separately. A failed/timed-out turn cannot pass simply
-  because a file check passed.
+- Reports independent artifact results, shutdown status, and host assessment
+  separately. A failed/timed-out turn cannot pass simply because a file check
+  passed.
 
-These changes do not establish answer quality or JEV uplift. The question-only
+These changes do not establish answer quality. The question-only
 grader still checks unchanged files, not semantic answer quality. The legacy
 shell grader itself has no process deadline or isolation; **use the existing
 Blueprint runner for resource-bounded live trials**, not this legacy suite as
 an untrusted-code or whole-trial timeout boundary. No live trials ran here.
 
-Existing scripted blocker recovery, real missing-input, JEV-off/on/unavailable,
-and exhausted-budget regressions remain part of the full native test suite.
+Existing scripted blocker recovery, real missing-input, and exhausted-budget
+regressions remain part of the full native test suite.
 They are conformance evidence, not a ranking of models or competing products.
 
 ## Source-preserving context prototype

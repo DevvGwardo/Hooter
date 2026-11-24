@@ -384,7 +384,8 @@ fn composer_shows_storage_failures_that_have_no_other_surface(cx: &mut TestAppCo
         // A real failure: `save` cannot create its temporary beside the config.
         let blocked = home.join("config.toml.tmp");
         std::fs::create_dir(&blocked).unwrap();
-        ui.click(cx, "jev-toggle");
+        ui.app
+            .update(cx, |app, cx| app.toggle_auto_continue_fixes(cx));
         assert!(ui.read(cx, |app, _| app.store_error.is_some()));
         assert!(
             has(&ui, cx, "store-error"),

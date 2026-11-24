@@ -1456,7 +1456,6 @@ fn config_for(dir: &TempDir, workspace: &TempDir, base_url: String) -> AgentConf
         workspace: workspace.path().into(),
         general: false,
         approval: crate::ApprovalMode::AskForChanges,
-        jev: None,
         session_dir: Some(dir.path().into()),
         context_budget_tokens: 0,
         reasoning_effort: None,

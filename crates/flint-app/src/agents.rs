@@ -28,7 +28,7 @@ pub fn parse_command(text: &str) -> Option<AgentKind> {
         "droid" | "factory" | "factory-droid" => Some(AgentKind::Droid),
         "opencode" | "open-code" | "open code" => Some(AgentKind::OpenCode),
         "hermes" => Some(AgentKind::Hermes),
-        "hooter" | "jevdex" | "flint" => Some(AgentKind::Flint),
+        "hooter" | "flint" => Some(AgentKind::Flint),
         _ => None,
     }
 }
@@ -214,8 +214,6 @@ mod tests {
         assert_eq!(parse_command("/agent flint"), Some(AgentKind::Flint));
         assert_eq!(parse_command("/agent hooter"), Some(AgentKind::Flint));
         assert_eq!(parse_command(" /agent Hooter "), Some(AgentKind::Flint));
-        assert_eq!(parse_command("/agent jevdex"), Some(AgentKind::Flint));
-        assert_eq!(parse_command(" /agent Jevdex "), Some(AgentKind::Flint));
         assert_eq!(parse_command("/agent droid"), Some(AgentKind::Droid));
         assert_eq!(parse_command(" /agent Droid "), Some(AgentKind::Droid));
         for command in [

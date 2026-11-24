@@ -169,7 +169,7 @@ evidence; completed root paint is required as well as control geometry.
 These rendering fixtures do not execute inference or prove task correctness.
 
 Routine guard corrections are working guidance, not approval requests.
-Recovered guidance and JEV evidence remain available under the work disclosure.
+Recovered guidance remains available under the work disclosure.
 A normal stop is labeled **Turn ended** unless the result is answered or
 explicitly accepted; it does not display a green completion claim above a
 blocked or partial result.

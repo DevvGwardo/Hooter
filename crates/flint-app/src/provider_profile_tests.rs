@@ -49,7 +49,6 @@ fn applying_a_profile_changes_only_provider_fields() {
     let mut settings = Settings {
         approval: "auto".into(),
         sandbox: false,
-        jev_judge: false,
         queue_after_verification: true,
         auto_continue_fixes: true,
         effort: "high".into(),

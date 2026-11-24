@@ -50,7 +50,7 @@ pub(super) fn exists_check(_workspace: &std::path::Path, path: &str) -> String {
 }
 
 #[tokio::test]
-async fn finalization_recovers_after_a_setup_command_invalidates_passing_checks_with_jev_off() {
+async fn finalization_recovers_after_a_setup_command_invalidates_passing_checks() {
     let (_root, ws) = temp_workspace();
     let setup = if cfg!(windows) {
         "echo setup>setup.txt"
@@ -98,11 +98,6 @@ async fn finalization_recovers_after_a_setup_command_invalidates_passing_checks_
         2
     );
     assert!(events.iter().any(|event| matches!(event, AgentEvent::HarnessNudge { message, .. } if message.contains("became stale"))));
-    assert!(
-        !events
-            .iter()
-            .any(|event| matches!(event, AgentEvent::JevVerdict { .. }))
-    );
     assert_eq!(
         std::fs::read_to_string(ws.join("result.txt")).unwrap(),
         "result"
@@ -147,7 +142,7 @@ async fn no_progress_stop_preserves_specific_diagnostics_through_saved_history()
 }
 
 #[tokio::test]
-async fn jev_updates_apply_between_turns_without_changing_edit_approvals() {
+async fn edits_apply_between_turns_without_changing_approval_requirements() {
     let (_root, ws) = temp_workspace();
     let (url, _) = mock_server(vec![
         sse_tool_call(
@@ -173,30 +168,13 @@ async fn jev_updates_apply_between_turns_without_changing_edit_approvals() {
         sse_text("Third still needs verification."),
     ])
     .await;
-    let (judge_url, judged) = mock_judge(0.9).await;
-    let judge = crate::JevConfig {
-        api_key: "offline-judge".into(),
-        base_url: judge_url,
-        model: "fixture".into(),
-    };
     let mut config = test_config(url, ws.clone());
-    config.jev = Some(judge.clone());
     config.approval = ApprovalMode::AskForChanges;
     let handle = crate::spawn_session(config);
-    for turn in 0..3 {
-        if turn == 2 {
-            handle
-                .ops
-                .send(Op::SetJev(Some(judge.clone())))
-                .await
-                .unwrap();
-        }
+    for name in ["first", "second", "third"] {
         handle
             .ops
-            .send(Op::UserMessage(format!(
-                "Create {}.txt.",
-                ["first", "second", "third"][turn]
-            )))
+            .send(Op::UserMessage(format!("Create {name}.txt.")))
             .await
             .unwrap();
         let mut events = Vec::new();
@@ -206,9 +184,6 @@ async fn jev_updates_apply_between_turns_without_changing_edit_approvals() {
                 .unwrap()
                 .unwrap();
             if let AgentEvent::ApprovalRequested { call_id, .. } = &event {
-                if turn == 0 {
-                    handle.ops.send(Op::SetJev(None)).await.unwrap();
-                }
                 handle
                     .ops
                     .send(Op::Approval {
@@ -227,17 +202,11 @@ async fn jev_updates_apply_between_turns_without_changing_edit_approvals() {
         assert!(
             events
                 .iter()
-                .any(|event| matches!(event, AgentEvent::ApprovalRequested { .. }))
-        );
-        assert_eq!(
-            events
-                .iter()
-                .any(|event| matches!(event, AgentEvent::JevVerdict { .. })),
-            turn != 1
+                .any(|event| matches!(event, AgentEvent::ApprovalRequested { .. })),
+            "turn for {name}.txt must still ask for approval"
         );
         assert!(!assessed(&events).has_current_verification());
     }
-    assert_eq!(judged.lock().unwrap().len(), 2);
     for name in ["first", "second", "third"] {
         assert_eq!(
             std::fs::read_to_string(ws.join(format!("{name}.txt"))).unwrap(),
@@ -255,7 +224,7 @@ async fn jev_updates_apply_between_turns_without_changing_edit_approvals() {
 }
 
 #[tokio::test]
-async fn jev_changes_reach_resumed_and_new_subagents_without_loosening_readonly_scope() {
+async fn resumed_readonly_subagent_keeps_scope_while_a_new_child_can_edit() {
     let (_root, ws) = temp_workspace();
     let (url, _) = mock_server(vec![
         sse_tool_call(
@@ -273,13 +242,7 @@ async fn jev_changes_reach_resumed_and_new_subagents_without_loosening_readonly_
         sse_text("Written but not yet verified."),
     ])
     .await;
-    let (judge_url, judged) = mock_judge(0.9).await;
-    let mut config = test_config(url, ws.clone());
-    config.jev = Some(crate::JevConfig {
-        api_key: "offline-judge".into(),
-        base_url: judge_url,
-        model: "fixture".into(),
-    });
+    let config = test_config(url, ws.clone());
     let (tx, _rx) = async_channel::unbounded();
     let approvals = Arc::new(Approvals::default());
     let mut parent = Session::new(
@@ -301,8 +264,6 @@ async fn jev_changes_reach_resumed_and_new_subagents_without_loosening_readonly_
         .unwrap();
     let id = child.id.clone();
     parent.subagents.as_mut().unwrap().put(child);
-    parent.stage_jev(None);
-    parent.apply_jev_settings();
     let resume =
         json!({"session_id":id,"label":"Inspect","message":"Review only. Do not modify files."});
     let (mut child, message) = parent
@@ -318,7 +279,6 @@ async fn jev_changes_reach_resumed_and_new_subagents_without_loosening_readonly_
         .run_turn(message, &CancellationToken::new())
         .await;
     assert!(!ws.join("forbidden.txt").exists());
-    assert!(child.session.config.jev.is_none());
     parent.subagents.as_mut().unwrap().put(child);
     let request = json!({"label":"Create","message":"Create allowed.txt."});
     let (mut child, message) = parent
@@ -332,16 +292,14 @@ async fn jev_changes_reach_resumed_and_new_subagents_without_loosening_readonly_
         .session
         .run_turn(message, &CancellationToken::new())
         .await;
-    assert!(child.session.config.jev.is_none());
     assert_eq!(
         std::fs::read_to_string(ws.join("allowed.txt")).unwrap(),
         "ok"
     );
-    assert!(judged.lock().unwrap().is_empty());
 }
 
 #[tokio::test]
-async fn passing_format_check_preserves_verification_and_skips_unnecessary_jev() {
+async fn passing_format_check_preserves_verification() {
     let (_root, ws) = temp_workspace();
     std::fs::create_dir_all(ws.join("src")).unwrap();
     std::fs::write(
@@ -369,13 +327,7 @@ async fn passing_format_check_preserves_verification_and_skips_unnecessary_jev()
         sse_text("Created the library and checked formatting."),
     ])
     .await;
-    let (judge_url, judged) = mock_judge(0.1).await;
-    let mut config = test_config(url, ws);
-    config.jev = Some(crate::JevConfig {
-        api_key: "offline-judge".into(),
-        base_url: judge_url,
-        model: "fixture".into(),
-    });
+    let config = test_config(url, ws);
     let events = run_one_turn_config(config, "Create src/lib.rs and check its formatting.").await;
     let task = assessed(&events);
     assert!(task.checks.iter().all(|check| check.success));
@@ -387,15 +339,15 @@ async fn passing_format_check_preserves_verification_and_skips_unnecessary_jev()
         TaskOutcome::NeedsReview
     );
     assert!(task.verified_for_queue());
-    assert!(!events.iter().any(|event| matches!(
-        event,
-        AgentEvent::HarnessNudge { .. } | AgentEvent::JevVerdict { .. },
-    )));
-    assert!(judged.lock().unwrap().is_empty());
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, AgentEvent::HarnessNudge { .. }))
+    );
 }
 
 #[tokio::test]
-async fn failed_verification_uses_its_observed_exit_code_not_a_jev_opinion() {
+async fn failed_verification_uses_its_observed_exit_code() {
     let (_root, ws) = temp_workspace();
     let command = if cfg!(windows) {
         r#"py -c "assert False""#
@@ -413,13 +365,7 @@ async fn failed_verification_uses_its_observed_exit_code_not_a_jev_opinion() {
         sse_text("The check still fails; the result is incomplete."),
     ])
     .await;
-    let (judge_url, judged) = mock_judge(0.9).await;
-    let mut config = test_config(url, ws);
-    config.jev = Some(crate::JevConfig {
-        api_key: "offline-judge".into(),
-        base_url: judge_url,
-        model: "fixture".into(),
-    });
+    let config = test_config(url, ws);
     let events = run_one_turn_config(config, "Create and verify result.txt.").await;
     assert_eq!(
         assessed(&events).assessment.as_ref().unwrap().outcome,
@@ -435,7 +381,6 @@ async fn failed_verification_uses_its_observed_exit_code_not_a_jev_opinion() {
     assert!(events.iter().any(|event| matches!(
         event, AgentEvent::HarnessNudge { message, .. } if message.contains(command),
     )));
-    assert!(judged.lock().unwrap().is_empty());
 }
 
 #[tokio::test]
@@ -536,60 +481,6 @@ async fn repaired_agent_blockers_can_be_explicitly_resolved_without_user_accepta
         TaskOutcome::NeedsReview
     );
     assert!(!task.is_accepted());
-}
-
-#[tokio::test]
-async fn cancelling_a_pending_jev_request_interrupts_without_waiting_for_its_timeout() {
-    let (_root, ws) = temp_workspace();
-    let (url, _) = mock_server(vec![
-        sse_tool_call(
-            "write",
-            "write_file",
-            json!({"path":"result.txt","content":"unverified"}),
-        ),
-        sse_text("Done."),
-    ])
-    .await;
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let judge_url = format!("http://{}", listener.local_addr().unwrap());
-    let (entered, started) = tokio::sync::oneshot::channel();
-    tokio::spawn(async move {
-        let (socket, _) = listener.accept().await.unwrap();
-        entered.send(()).unwrap();
-        tokio::time::sleep(Duration::from_secs(10)).await;
-        drop(socket);
-    });
-    let mut config = test_config(url, ws);
-    config.jev = Some(crate::JevConfig {
-        api_key: "offline-judge".into(),
-        base_url: judge_url,
-        model: "fixture".into(),
-    });
-    let handle = crate::spawn_session(config);
-    handle
-        .ops
-        .send(Op::UserMessage("Create result.txt.".into()))
-        .await
-        .unwrap();
-    tokio::time::timeout(Duration::from_secs(3), started)
-        .await
-        .unwrap()
-        .unwrap();
-    handle.ops.send(Op::Interrupt).await.unwrap();
-    let mut events = Vec::new();
-    tokio::time::timeout(Duration::from_secs(1), collect_turn(&handle, &mut events))
-        .await
-        .unwrap();
-    assert!(events.iter().any(|event| matches!(
-        event,
-        AgentEvent::TurnFinished {
-            reason: TurnEndReason::Interrupted,
-            ..
-        },
-    )));
-    handle.ops.send(Op::Shutdown).await.unwrap();
-    while let Ok(Ok(_)) = tokio::time::timeout(Duration::from_secs(3), handle.events.recv()).await {
-    }
 }
 
 #[tokio::test]

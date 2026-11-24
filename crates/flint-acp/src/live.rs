@@ -356,7 +356,7 @@ impl Live {
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 Next::Continue
             }
-            Some(Op::SetReasoningEffort(_) | Op::SetJev(_)) => Next::Continue,
+            Some(Op::SetReasoningEffort(_)) => Next::Continue,
             Some(
                 Op::EditTask(_)
                 | Op::ReviewTask(_)
@@ -466,7 +466,7 @@ impl Live {
                             self.set_option(&id, &value).await;
                         }
                     }
-                    Ok(Op::SetReasoningEffort(_) | Op::SetJev(_)) => {}
+                    Ok(Op::SetReasoningEffort(_)) => {}
                     Ok(Op::EditTask(_) | Op::ReviewTask(_) | Op::ContinueTask { .. } | Op::AutomaticallyReviewTask { .. }) => self.shared.emit_all(vec![AgentEvent::Error(
                         "Native task controls cannot govern this external agent's loop.".into(),
                     )]),

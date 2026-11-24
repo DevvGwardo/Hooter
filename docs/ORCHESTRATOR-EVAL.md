@@ -11,8 +11,8 @@ There are two distinct layers:
   and completion guards. `tools/blueprint/orchestrator.py` evaluates that loop
   using disposable tasks, an isolated provider proxy and independent graders.
 
-Neither `TurnFinished::Completed`, a model's final message, a successful child
-transport result nor a judge verdict is acceptance.
+Neither `TurnFinished::Completed`, a model's final message, nor a successful
+child transport result is acceptance.
 
 ## Reproduce
 
@@ -28,7 +28,7 @@ HOOTER_EVAL_TYPESCRIPT_LIB=/absolute/typescript/lib \
   python3 tools/blueprint/orchestrator.py --max-calls 600 --max-tokens 3000000
 ```
 
-The current offline pilot contains 48 scenarios: eight tasks, three variants, two
+The current offline pilot contains 32 scenarios: eight tasks, two variants, two
 repetitions. Scripted providers issue real native read/write/command/report
 and delegation calls. Offline results establish harness conformance and
 native execution paths, **not model reasoning quality**.
@@ -78,8 +78,7 @@ source drift or pending reservations cannot be resumed.
 | Variant | Native engine behaviour |
 | --- | --- |
 | `single` | `spawn_agent` is neither advertised nor executable |
-| `delegated` | Normal native subagent availability, no judge |
-| `delegated-gemini-judge` | Subagents plus an experimental Gemini judge adapter |
+| `delegated` | Normal native subagent availability |
 
 `ExecutionOptions` changes tool availability, not approvals or production
 sandbox defaults. All variants share the same model, reasoning effort, public
@@ -91,21 +90,6 @@ The parallel task explicitly asks for two separate delegations when the tool
 is available. Delegation counts are retained rather than assuming agents
 used the feature. This is a controlled policy comparison, not a promise that
 delegation improves tiny tasks.
-
-### The Gemini judge is not JEV
-
-Native JEV uses Typesafe's `/v1/systemone` API and calibrated `noul` answers.
-Gemini's OpenAI-compatible endpoint does not implement that API. The
-evaluation proxy translates one frozen guard question into a Gemini JSON
-probability request and translates the result back for the existing guard.
-This adapter is experimental and uncalibrated, explicitly labelled in every
-report. It never becomes the independent grader.
-
-Judge calls, failures and verdicts are counted. The native five-second judgment
-timeout remains unchanged. A timeout or malformed probability is not a valid
-verdict. Zero judge calls means no evidence about judge contribution, not that
-judgment works or is free. This runner cannot establish Typesafe JEV quality
-without separately authorized Typesafe runs.
 
 ## Tasks and scoring
 
@@ -198,12 +182,11 @@ Default model-phase budgets:
 
 | Limit | Value |
 | --- | --- |
-| Combined parent/child/judge calls | 300 |
+| Combined parent/child calls | 300 |
 | Combined reserved tokens | 1,000,000 |
 | Combined model-phase wall time | 1,800 seconds |
 | Per-run calls / tokens / wall time | 24 / 160,000 / 180 seconds |
 | Per-agent-response output cap | 2,048 tokens |
-| Per-judge-response output cap | 256 tokens |
 
 Before each call, conservative input bytes plus message overhead and the output
 cap are reserved under a shared lock. Valid reported usage settles the
@@ -217,8 +200,8 @@ and no exact dollar cost is inferred from token estimates.
 
 ### Bun and analysis completion repair
 
-The observed user session had four Verify follow-ups, no JEV verdicts, and Bun
-commands that were not recognized as verification. Output-filtering pipes and
+The observed user session had four Verify follow-ups and Bun commands that
+were not recognized as verification. Output-filtering pipes and
 `; echo` also hid check exits, encouraged by obsolete tool guidance. The request
 “analyze this for improvements and gaps to fix” was incorrectly inferred as Work.
 
@@ -243,7 +226,7 @@ Continuation-limit issues now explain that finish conditions remain unresolved.
 
 The new live feature pass has a separately authorized hard cap of 120 combined
 calls and 300,000 tokens, subscription only. Its three cases each run once under
-all three variants, not a statistical policy ranking or a pre-fix Bun A/B.
+both variants, not a statistical policy ranking or a pre-fix Bun A/B.
 
 ## Evidence and interpretation
 
@@ -255,7 +238,7 @@ Each run prints fresh `report.json` and `report.html` paths. It retains:
 - Per-request model/provider metadata, usage provenance and request hashes,
   without Authorization headers or upstream error bodies.
 - Scenario results, verification/outcome evidence, nudges, approvals,
-  delegations, judge failures and wall times.
+  delegations and wall times.
 
 Build the bridge immediately before evaluating. An explicitly supplied
 `--bridge` is identified by hash; that alone does not prove it was compiled
@@ -267,7 +250,7 @@ The durable foundation tests also cover crash/publication boundaries, identical
 retries after caller cancellation, immutable identities, missing/corrupt
 lineage, writer leases, bounded queues and orderly shutdown. Running the full
 agent library suite includes those tests and the existing native child,
-approval, read-only, verification and JEV-cancellation regressions.
+approval, read-only and verification regressions.
 
 ## Measured pilot, 2026-10-10
 

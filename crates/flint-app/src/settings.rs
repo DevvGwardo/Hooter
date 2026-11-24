@@ -1,7 +1,6 @@
 //! User settings in `~/.flint/config.toml` (or `$FLINT_HOME/config.toml`):
-//! model, base URL, default approval mode, reasoning effort, the JEV judge
-//! toggle, theme, and one-time tips. Read on startup, written by the Settings
-//! sheet.
+//! model, base URL, default approval mode, reasoning effort, theme, and
+//! one-time tips. Read on startup, written by the Settings sheet.
 
 use std::path::Path;
 use std::path::PathBuf;
@@ -151,10 +150,6 @@ pub struct Settings {
     pub api_key_file: String,
     /// `auto` or `ask`.
     pub approval: String,
-    /// Ask the optional JEV judge to confirm harness suspicions. The judge runs
-    /// only when this is on *and* a TypeSafe credential is present; `false`
-    /// always keeps the harness on its own heuristics.
-    pub jev_judge: bool,
     /// Continue queued native work after current passing verification, without
     /// accepting its result or changing approvals/sandboxing. Off by default.
     pub queue_after_verification: bool,
@@ -229,8 +224,6 @@ impl Default for Settings {
             // New installs start in ask mode. Existing config files retain
             // their saved choice, including auto-run.
             approval: "ask".to_string(),
-            // Existing installs keep the judge on when a credential is present.
-            jev_judge: true,
             queue_after_verification: false,
             auto_continue_fixes: false,
             permission_choice_pending: None,
@@ -425,8 +418,8 @@ pub(crate) fn agent_from_key(key: &str) -> Option<flint_agent::AgentKind> {
 const LEGACY_BASE_URL: &str = "http://127.0.0.1:18433/v1";
 const LEGACY_MODEL: &str = "deepseek-v4.1-flash";
 
-/// Where API keys may come from besides the settings: environment variables,
-/// a private TypeSafe key file, and the key file of early installs. The app takes this as a parameter so
+/// Where API keys may come from besides the settings: environment variables
+/// and the key file of early installs. The app takes this as a parameter so
 /// tests can run without the developer's environment or home directory.
 #[derive(Debug, Clone)]
 pub struct KeySources {
@@ -447,16 +440,14 @@ impl KeySources {
 }
 
 impl Default for KeySources {
-    /// The process environment, `$FLINT_HOME/keys/typesafe.key` for the optional
-    /// judge when its environment key is absent, and `~/.fx/surplus.key`.
+    /// The process environment and `~/.fx/surplus.key`.
     fn default() -> Self {
         Self {
             env: |name| {
-                key_with_typesafe_fallback(
-                    name,
-                    std::env::var(name).ok(),
-                    &flint_home().join("keys").join("typesafe.key"),
-                )
+                std::env::var(name)
+                    .ok()
+                    .map(|key| key.trim().to_string())
+                    .filter(|key| !key.is_empty())
             },
             legacy_key_file: Some(home().join(".fx").join("surplus.key")),
         }
@@ -539,21 +530,6 @@ pub struct ResolvedKey {
 fn read_key_file(path: &Path) -> Option<String> {
     let key = std::fs::read_to_string(path).ok()?;
     Some(key.trim().to_string()).filter(|key| !key.is_empty())
-}
-
-fn key_with_typesafe_fallback(
-    name: &str,
-    environment: Option<String>,
-    typesafe_file: &Path,
-) -> Option<String> {
-    environment
-        .map(|key| key.trim().to_string())
-        .filter(|key| !key.is_empty())
-        .or_else(|| {
-            (name == "TYPESAFE_API_KEY")
-                .then(|| read_key_file(typesafe_file))
-                .flatten()
-        })
 }
 
 /// Expands a leading `~/` to the home directory.
@@ -704,10 +680,6 @@ fn is_loopback_endpoint(base: &str) -> bool {
                     .parse::<std::net::IpAddr>()
                     .is_ok_and(|address| address.is_loopback())
         })
-}
-
-pub fn jev_key_set(sources: &KeySources) -> bool {
-    (sources.env)("TYPESAFE_API_KEY").is_some_and(|key| !key.trim().is_empty())
 }
 
 /// `~/…` for paths under the home directory.

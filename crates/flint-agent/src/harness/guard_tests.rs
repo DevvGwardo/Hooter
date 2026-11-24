@@ -10,7 +10,6 @@ fn failed_edits_do_not_claim_mutation_but_keep_call_accounting() {
     guard.record_tool_call("edit_file", ToolKind::Edit, &args, Some("a.rs"));
     guard.record_tool_result("edit_file", ToolKind::Edit, &args, "declined", None, false);
     assert!(!guard.edited_files);
-    assert!(guard.edited_paths.is_empty());
     assert_eq!(guard.tool_calls, 1);
 }
 
@@ -27,16 +26,12 @@ fn read_range_saturates_at_u64_max() {
 }
 
 #[test]
-fn identical_calls_raise_a_suspect_then_a_nudge() {
+fn identical_calls_trigger_a_stuck_nudge_on_the_third_repeat() {
     let mut guard = TurnGuard::new("fix the build");
     let args = json!({"path": "a.rs"});
     guard.record_tool_call("read_file", ToolKind::Read, &args, None);
-    assert_eq!(guard.take_stuck_suspect(), None);
+    assert_eq!(guard.take_stuck_nudge(), None);
     guard.record_tool_call("read_file", ToolKind::Read, &args, None);
-    assert_eq!(
-        guard.take_stuck_suspect(),
-        Some(r#"read_file({"path":"a.rs"})"#.to_string())
-    );
     assert_eq!(guard.take_stuck_nudge(), None);
     guard.record_tool_call("read_file", ToolKind::Read, &args, None);
     assert_eq!(
@@ -141,57 +136,6 @@ fn watchdog_only_for_change_requests() {
     assert_eq!(question.before_finish(), None);
 }
 
-#[test]
-fn judge_states_are_capped_and_shaped() {
-    let mut guard = TurnGuard::new("fix it");
-    guard.record_tool_call(
-        "edit_file",
-        ToolKind::Edit,
-        &json!({"path": "a.rs"}),
-        Some("a.rs"),
-    );
-    guard.record_tool_result(
-        "edit_file",
-        ToolKind::Edit,
-        &json!({"path":"a.rs"}),
-        "edited",
-        None,
-        true,
-    );
-    let cmd = json!({"command": "ls"});
-    guard.record_tool_call("run_command", ToolKind::Command, &cmd, None);
-    guard.record_tool_result(
-        "run_command",
-        ToolKind::Command,
-        &cmd,
-        "a.rs\n[exit code: 0]",
-        Some(0),
-        true,
-    );
-    assert_eq!(
-        guard.verify_state("Done."),
-        json!({
-            "files_edited": ["a.rs"],
-            "commands_after_last_edit": [{"command": "ls", "exit_code": 0}],
-            "final_message": "Done.",
-        })
-    );
-    for i in 0..20 {
-        guard.record_tool_call(
-            "read_file",
-            ToolKind::Read,
-            &json!({"path": format!("f{i}")}),
-            None,
-        );
-    }
-    assert_eq!(
-        guard.stall_state()["recent_tool_calls"]
-            .as_array()
-            .map(Vec::len),
-        Some(8)
-    );
-}
-
 fn edit(guard: &mut TurnGuard) {
     guard.record_tool_call(
         "edit_file",
@@ -210,27 +154,6 @@ fn edit(guard: &mut TurnGuard) {
 }
 
 #[test]
-fn judge_history_keeps_latest_check_after_twenty_inspections() {
-    let mut guard = TurnGuard::new("Fix a.rs");
-    edit(&mut guard);
-    for i in 0..20 {
-        command(&mut guard, &format!("ls folder{i}"), "listed", 0);
-    }
-    command(&mut guard, "cargo test", "passed", 0);
-    let state = guard.verify_state("Checked.");
-    let commands = state["commands_after_last_edit"].as_array().unwrap();
-    assert_eq!(commands.len(), JEV_MAX_COMMANDS);
-    assert_eq!(commands.last().unwrap()["command"], "cargo test");
-    assert_eq!(commands.last().unwrap()["exit_code"], 0);
-    assert_eq!(
-        guard.finish_check(),
-        None,
-        "facts need no additional JEV veto"
-    );
-    assert_eq!(guard.before_finish(), None);
-}
-
-#[test]
 fn shell_effects_require_verification_not_a_false_zero_edit_watchdog() {
     let mut guard = TurnGuard::new("Create output.txt");
     command(&mut guard, "printf done > output.txt", "", 0);
@@ -241,14 +164,6 @@ fn shell_effects_require_verification_not_a_false_zero_edit_watchdog() {
     );
     command(&mut guard, "test -s output.txt", "", 0);
     assert_eq!(guard.before_finish(), None);
-    assert_eq!(
-        guard.watchdog_state("Created.")["untracked_command_effects"],
-        true
-    );
-    assert!(
-        guard.edited_paths.is_empty(),
-        "do not invent shell-edit paths"
-    );
 }
 
 #[test]
@@ -285,10 +200,6 @@ fn host_revision_evidence_overrides_legacy_guard_success() {
     });
     guard.set_task_record(&task);
     assert_eq!(guard.finish_check(), Some(FinishCheck::Verify));
-    assert_eq!(
-        guard.verify_state("Done.")["current_verification_passed"],
-        false
-    );
     assert!(guard.before_finish().is_some());
 }
 
@@ -385,13 +296,9 @@ fn overlapping_rereads_of_one_file_are_stuck() {
         read(&mut guard, offset);
     }
     assert_eq!(guard.take_stuck_nudge(), None);
-    assert_eq!(guard.take_stuck_suspect(), None);
     read(&mut guard, 50);
     read(&mut guard, 150);
-    assert_eq!(
-        guard.take_stuck_suspect(),
-        Some("read_file big.rs".to_string())
-    );
+    assert_eq!(guard.take_stuck_nudge(), None);
     read(&mut guard, 250);
     assert_eq!(
         guard.take_stuck_nudge(),
@@ -547,28 +454,4 @@ fn usable_child_report_counts_as_observed_work_without_watchdog() {
     guard.set_task_record(&task);
     assert_eq!(guard.finish_check(), None);
     assert_eq!(guard.before_finish(), None);
-}
-
-#[test]
-fn requires_deterministic_verification_tracks_observed_edits() {
-    let mut guard = TurnGuard::new("fix the bug");
-    let mut task = crate::task::TaskRecord::new(1, "fix the bug".into(), 0);
-    task.observed_edits = 1;
-    guard.set_task_record(&task);
-    assert!(guard.requires_deterministic_verification());
-
-    task.checks.push(crate::task::CommandEvidence {
-        id: 1,
-        call_id: "c1".to_string(),
-        command: "cargo test".to_string(),
-        contract_revision: task.contract.revision,
-        work_revision: task.work_revision,
-        started_revision: task.work_revision,
-        success: true,
-        exit_code: Some(0),
-        detail: "ok".to_string(),
-        verification: true,
-    });
-    guard.set_task_record(&task);
-    assert!(!guard.requires_deterministic_verification());
 }

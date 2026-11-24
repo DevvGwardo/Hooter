@@ -447,7 +447,6 @@ impl Session {
                 streaming: true, ..
             }) => "Writing…".to_string(),
             Some(Item::Nudge { .. }) => "Checking its work…".to_string(),
-            Some(Item::Jev { .. }) => "Checking its work…".to_string(),
             _ => "Working…".to_string(),
         }
     }

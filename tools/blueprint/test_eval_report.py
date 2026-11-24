@@ -55,6 +55,8 @@ class EvidencePageTests(unittest.TestCase):
             self.assertIn("2026-10-10", page)
             self.assertIn("1,234", page)
             self.assertIn("304 + 125", page)
+            self.assertNotIn("Gemini judge", page)
+            self.assertNotIn("judge off", page)
 
     def test_failed_validation_cannot_render_a_passing_page(self):
         with tempfile.TemporaryDirectory() as directory:

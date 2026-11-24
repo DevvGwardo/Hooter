@@ -583,7 +583,6 @@ pub fn item_kind(item: &Item) -> &'static str {
         Item::Thinking { .. } => "thinking",
         Item::Tool(_) => "tool",
         Item::Nudge { .. } => "nudge",
-        Item::Jev { .. } => "jev",
         Item::Repair { .. } => "repair",
         Item::Approval { .. } => "approval",
         Item::Error(_) => "error",

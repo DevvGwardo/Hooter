@@ -10,7 +10,6 @@ use std::time::Duration;
 use flint_agent::AgentEvent;
 use flint_agent::ApprovalDecision;
 use flint_agent::FileDiff;
-use flint_agent::JevQuestion;
 use flint_agent::NudgeReason;
 use flint_agent::ToolKind;
 use flint_agent::TurnEndReason;
@@ -38,12 +37,6 @@ pub enum Item {
         reason: NudgeReason,
         message: String,
         expanded: bool,
-    },
-    /// The optional JEV judge's verdict on a harness suspicion.
-    Jev {
-        question: JevQuestion,
-        probability: f64,
-        confirmed: bool,
     },
     /// The engine trimmed old history to fit the context budget.
     Compacted {
@@ -573,21 +566,6 @@ impl SessionView {
                         reason,
                         message,
                         expanded: false,
-                    })
-                    .appended;
-                change
-            }
-            AgentEvent::JevVerdict {
-                question,
-                probability,
-                confirmed,
-            } => {
-                let mut change = self.close_streams(now);
-                change.appended = self
-                    .push(Item::Jev {
-                        question,
-                        probability,
-                        confirmed,
                     })
                     .appended;
                 change
