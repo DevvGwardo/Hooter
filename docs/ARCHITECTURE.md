@@ -106,7 +106,6 @@ graph TD
         ClaudeCode["Claude Code CLI"]
         CodexCLI["Codex CLI"]
         DroidCLI["Droid (Factory)"]
-        JEV["Typesafe JEV Judge"]
     end
 
     Window --> Panels
@@ -131,7 +130,6 @@ graph TD
     ACPBridge --> DroidCLI
 
     ContextMgr <--> OpenAI
-    Guard -.-> JEV
 
     class Window,SessionMgr,Guard,SubagentOrch,ACPClient ember;
     class ClaudeCode,CodexCLI,DroidCLI,OpenAI cyan;
@@ -182,7 +180,6 @@ sequenceDiagram
     participant Guard as Harness Guard Pipeline
     participant LLM as Model Endpoint
     participant Tools as Tool Execution & PTY
-    participant Judge as Typesafe JEV Judge (Optional)
 
     User->>App: Submits prompt (+ optional images, @files)
     App->>Engine: Initiate Turn (session_id, workspace_path)
@@ -196,11 +193,6 @@ sequenceDiagram
         Guard->>Guard: Check for repetitive tool loops
         Guard->>Guard: Watchdog check (turns editing nothing)
         Guard->>Guard: Validate/repair malformed arguments
-        
-        opt JEV Judge Configured
-            Guard->>Judge: Verify loop / termination suspicion
-            Judge-->>Guard: Confirmation / Dismissal
-        end
 
         alt Requires Approval
             Engine->>App: Prompt user for approval (y / a / n)
@@ -269,13 +261,8 @@ flowchart TD
     WatchdogCheck -->|Warning| TriggerWatchdog["Inject Guidance Prompt"]
     WatchdogCheck -->|OK| ExecTool["Execute Tool within Sandbox"]
 
-    TriggerLoop --> JEVCheck{"JEV Judge Enabled?"}
-    TriggerWatchdog --> JEVCheck
-    JEVCheck -->|Yes| ConsultJEV["Consult Typesafe JEV API"]
-    ConsultJEV --> ActionConfirm{"Judge Confirms?"}
-    ActionConfirm -->|Yes| HaltTurn["Halt / Re-prompt Agent"]
-    ActionConfirm -->|No| ExecTool
-    JEVCheck -->|No| HaltTurn
+    TriggerLoop --> HaltTurn["Halt / Re-prompt Agent"]
+    TriggerWatchdog --> HaltTurn
 
     CheckTool -->|No| TestCheck{"Marked as Done & Changes Made?"}
     TestCheck -->|Yes| VerifyTests{"Were Verification Tests Executed?"}
@@ -283,10 +270,10 @@ flowchart TD
     VerifyTests -->|Yes| Complete["Turn Concluded Successfully"]
     TestCheck -->|No| Complete
 
-    class Start,CheckTool,ArgCheck,LoopCheck,LoopAction,WatchdogCheck,JEVCheck,TestCheck,VerifyTests,ActionConfirm ember;
+    class Start,CheckTool,ArgCheck,LoopCheck,LoopAction,WatchdogCheck,TestCheck,VerifyTests ember;
     class ExecTool,Complete green;
     class TriggerLoop,TriggerWatchdog,HaltTurn,TestReminder red;
-    class Repair,ConsultJEV cyan;
+    class Repair cyan;
 ```
 </details>
 

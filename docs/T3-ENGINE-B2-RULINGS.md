@@ -40,9 +40,9 @@ all historical/shared contract files remain unchanged.
    Interactive secret inbox/reply/prompt, watch auth and external sinks remain
    Unsupported. Existing Provider String copies preclude memory-secrecy claims.
 5. **Accept explicit temporary unsupported matrix.** Only the new private path
-   rejects configured MCP/JEV and all child/model-lookup/override/Undo operations
+   rejects configured MCP and all child/model-lookup/override/Undo operations
    before process/network/metadata effects. No Subagents constructor or startup
-   /models call. Legacy four-child/MCP/JEV behavior must not regress.
+   /models call. Legacy four-child/MCP behavior must not regress.
 6. **Accept private fixture delivery only in B2a.** Retain exact authoritative
    completion/history durably and use a finite non-dropping critical collector
    for tests. Declare its item/body/aggregate ceilings and saturation behavior
@@ -113,7 +113,7 @@ Specify one concrete representation, not alternatives:
 - Exact staged preparation/native-loop persistence hooks, guarded built-in
   pre-spawn/pre-file-mutation/pre-fetch-send points, lossless failure unwind,
   single-attempt HTTP/client construction and finite live stop/approval routing.
-  No earlier provider budget query, JEV, child or hidden legacy saver.
+  No earlier provider budget query, child or hidden legacy saver.
 - Credential validation/ownership/clearing/error behavior. Check native error/
   Debug/receipt/log paths with dummy credential sentinels, including provider
   error-body echo. Explicitly identify any remaining privacy gap before code.

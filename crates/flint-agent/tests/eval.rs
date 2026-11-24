@@ -1,6 +1,5 @@
 //! A small, reproducible task suite for measuring the agent against a live
-//! model, so claims like "the JEV judge is worth N points" can be checked
-//! from this repo. Runs only with FLINT_EVAL=1:
+//! model. Runs only with FLINT_EVAL=1:
 //!
 //! ```sh
 //! FLINT_EVAL=1 FLINT_API_KEY=… FLINT_MODEL=… \
@@ -8,10 +7,8 @@
 //! ```
 //!
 //! - `FLINT_BASE_URL` / `FLINT_MODEL`: the endpoint and model under test.
-//! - `FLINT_EVAL_TRIALS` (default 3): runs per task and variant.
+//! - `FLINT_EVAL_TRIALS` (default 3): runs per task.
 //! - `FLINT_EVAL_TASKS`: comma-separated task names to run (default all).
-//! - With `TYPESAFE_API_KEY` set, every task also runs without the judge,
-//!   so the report compares `jev` with `no-jev` on the same tasks.
 //!
 //! Each task starts from fixed files in a fresh directory and is graded by a
 //! shell check the agent never sees. The report goes to stderr and to
@@ -109,7 +106,6 @@ struct Outcome {
     artifact_passed: Option<bool>,
     shutdown_verified: bool,
     assessment: Option<serde_json::Value>,
-    jev_verdicts: Vec<serde_json::Value>,
     reason: TurnEndReason,
     steps: u32,
     nudges: u32,
@@ -242,7 +238,7 @@ async fn grading_barrier_requires_a_verified_shutdown_not_just_turn_completion()
     assert!(!await_shutdown(&events, Instant::now() + Duration::from_millis(10)).await);
 }
 
-async fn run_task(task: &Task, base: &AgentConfig, jev: bool) -> Outcome {
+async fn run_task(task: &Task, base: &AgentConfig) -> Outcome {
     let dir = tempfile::tempdir().expect("tempdir");
     let workspace = dir.path().canonicalize().expect("canonical");
     for (path, content) in task.files {
@@ -251,9 +247,6 @@ async fn run_task(task: &Task, base: &AgentConfig, jev: bool) -> Outcome {
     let mut config = base.clone();
     config.workspace = workspace.clone();
     config.approval = ApprovalMode::Auto;
-    if !jev {
-        config.jev = None;
-    }
     let started = Instant::now();
     let handle = flint_agent::spawn_session(config);
     handle
@@ -263,7 +256,7 @@ async fn run_task(task: &Task, base: &AgentConfig, jev: bool) -> Outcome {
         .expect("send");
     let deadline = Instant::now() + Duration::from_secs(600);
     let (mut steps, mut nudges, mut usage) = (0, 0, flint_agent::Usage::default());
-    let (mut assessment, mut jev_verdicts) = (None, Vec::new());
+    let mut assessment = None;
     let reason = loop {
         let event = match receive_until(&handle.events, deadline).await {
             Ok(event) => event,
@@ -274,15 +267,6 @@ async fn run_task(task: &Task, base: &AgentConfig, jev: bool) -> Outcome {
             AgentEvent::HarnessNudge { .. } => nudges += 1,
             AgentEvent::Usage(u) => usage = u,
             AgentEvent::TaskAssessed { task, .. } => assessment = Some(json!(task.assessment)),
-            AgentEvent::JevVerdict {
-                question,
-                probability,
-                confirmed,
-            } => {
-                jev_verdicts.push(json!({
-                    "question": question, "probability": probability, "confirmed": confirmed,
-                }));
-            }
             AgentEvent::TurnFinished { reason: r, .. } => {
                 break r;
             }
@@ -307,7 +291,6 @@ async fn run_task(task: &Task, base: &AgentConfig, jev: bool) -> Outcome {
         artifact_passed,
         shutdown_verified,
         assessment,
-        jev_verdicts,
         reason,
         steps,
         nudges,
@@ -331,64 +314,52 @@ fn eval_suite() {
     let only: Option<Vec<String>> = std::env::var("FLINT_EVAL_TASKS")
         .ok()
         .map(|list| list.split(',').map(|s| s.trim().to_string()).collect());
-    let variants: Vec<(&str, bool)> = if base.jev.is_some() {
-        vec![("jev", true), ("no-jev", false)]
-    } else {
-        vec![("no-jev", false)]
-    };
     let mut results = Vec::new();
-    let mut summary = Vec::new();
+    let (mut passed, mut total) = (0, 0);
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_time()
         .build()
         .expect("evaluation event runtime");
-    for (variant, jev) in &variants {
-        let (mut passed, mut total) = (0, 0);
-        for task in TASKS
-            .iter()
-            .filter(|t| only.as_ref().is_none_or(|o| o.iter().any(|n| n == t.name)))
-        {
-            for trial in 0..trials {
-                let outcome = runtime.block_on(run_task(task, &base, *jev));
-                eprintln!(
-                    "{variant:7} {:20} #{trial} {} {:?} steps={} nudges={} {:.0}s",
-                    task.name,
-                    if outcome.passed { "PASS" } else { "FAIL" },
-                    outcome.reason,
-                    outcome.steps,
-                    outcome.nudges,
-                    outcome.seconds
-                );
-                total += 1;
-                passed += usize::from(outcome.passed);
-                results.push(json!({
-                    "variant": variant, "task": task.name, "trial": trial,
-                    "passed": outcome.passed, "reason": format!("{:?}", outcome.reason),
-                    "artifact_passed": outcome.artifact_passed,
-                    "shutdown_verified": outcome.shutdown_verified,
-                    "assessment": outcome.assessment, "jev_verdicts": outcome.jev_verdicts,
-                    "steps": outcome.steps, "nudges": outcome.nudges,
-                    "input_tokens": outcome.input_tokens, "output_tokens": outcome.output_tokens,
-                    "seconds": outcome.seconds,
-                }));
-            }
+    for task in TASKS
+        .iter()
+        .filter(|t| only.as_ref().is_none_or(|o| o.iter().any(|n| n == t.name)))
+    {
+        for trial in 0..trials {
+            let outcome = runtime.block_on(run_task(task, &base));
+            eprintln!(
+                "{:20} #{trial} {} {:?} steps={} nudges={} {:.0}s",
+                task.name,
+                if outcome.passed { "PASS" } else { "FAIL" },
+                outcome.reason,
+                outcome.steps,
+                outcome.nudges,
+                outcome.seconds
+            );
+            total += 1;
+            passed += usize::from(outcome.passed);
+            results.push(json!({
+                "task": task.name, "trial": trial,
+                "passed": outcome.passed, "reason": format!("{:?}", outcome.reason),
+                "artifact_passed": outcome.artifact_passed,
+                "shutdown_verified": outcome.shutdown_verified,
+                "assessment": outcome.assessment,
+                "steps": outcome.steps, "nudges": outcome.nudges,
+                "input_tokens": outcome.input_tokens, "output_tokens": outcome.output_tokens,
+                "seconds": outcome.seconds,
+            }));
         }
-        let rate = if total == 0 {
-            0.0
-        } else {
-            passed as f64 / total as f64
-        };
-        eprintln!(
-            "== {variant}: {passed}/{total} passed ({:.0}%)",
-            rate * 100.0
-        );
-        summary.push(json!({"variant": variant, "passed": passed, "total": total, "rate": rate}));
     }
+    let rate = if total == 0 {
+        0.0
+    } else {
+        passed as f64 / total as f64
+    };
+    eprintln!("== {passed}/{total} passed ({:.0}%)", rate * 100.0);
     let report = json!({
         "model": base.model,
         "base_url": base.base_url,
         "trials": trials,
-        "summary": summary,
+        "summary": {"passed": passed, "total": total, "rate": rate},
         "results": results,
     });
     let out = std::env::var("FLINT_EVAL_OUT").unwrap_or_else(|_| {

@@ -57,8 +57,8 @@ release binary; `--tag before|after` labels the run (screenshots are
 
 ### `orchestrator.py`: independent native-loop evaluation
 
-Runs eight frozen tasks across single-agent, delegated and experimental
-Gemini-judge variants, with two paired repetitions by default. The offline
+Runs eight frozen tasks across single-agent and delegated variants, with two
+paired repetitions by default. The offline
 mode runs real native tools against scripted providers, not canned scores.
 Live mode uses an existing OmniRoute client key in memory and pins the
 Antigravity Gemini subscription route. It refuses configured fallback chains,
@@ -81,7 +81,7 @@ HOOTER_EVAL_TYPESCRIPT_LIB=/absolute/installed/typescript/lib \
 python3 tools/blueprint/orchestrator.py --live
 ```
 
-The 48-scenario offline matrix includes actual Bun/TypeScript checks, deliberate
+The 32-scenario offline matrix includes actual Bun/TypeScript checks, deliberate
 exit-masking recovery, and read-only analysis integrity. Bun must already be on
 PATH; the compiler library is read-only and hashed, never downloaded. The
 historical five-task matrix is available through `--tasks`. For the new nine-case
@@ -93,8 +93,7 @@ The default live pilot is capped at 300 combined model calls, 1,000,000
 conservatively reserved tokens and 1,800 seconds in its model phase. Every
 run also has its own call, token, reply and wall-clock caps. Missing usage
 keeps the full reservation; reported overruns stop further calls. No paid
-provider fallback is authorized. This is not an exact billing guarantee or
-an evaluation of calibrated Typesafe JEV. See
+provider fallback is authorized. This is not an exact billing guarantee. See
 [Orchestrator evaluation](../../docs/ORCHESTRATOR-EVAL.md) for scoring,
 reproduction, durability checks, safety boundaries and evidence limits.
 

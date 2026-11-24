@@ -57,7 +57,6 @@ REMAINING_SLOTS = ((1, "B"), (2, "A"), (2, "B"), (3, "A"), (3, "B"))
 PRIOR_COUNTS = (2, 1, 0, 0)
 ORIGINAL_BINARIES = {
     REPO / "target/release/flint": "26858d8f7a6e0137a6b977d3f46ceeb92b45095289eb2acfbe62d81b408ecdff",
-    REPO / "target/release/jevdex": "9414c98470ebf3846c1e143ae3e5942ba8ccb38f0236f0244a8376cf09c9e5e3",
 }
 SENTINEL_BYTES = b"R0D_SYNTHETIC_SENTINEL_NOT_A_CREDENTIAL\n"
 MAIN_RECORD = b'{"protocol":1,"event":"main"}\n'

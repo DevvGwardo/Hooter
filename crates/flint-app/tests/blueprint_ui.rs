@@ -45,8 +45,6 @@ mod failure_status_ui;
 mod file_preview_ui;
 #[path = "blueprint_ui/general.rs"]
 mod general_ui;
-#[path = "blueprint_ui/jev.rs"]
-mod jev_ui;
 mod local_provider;
 #[path = "blueprint_ui/menu_overflow.rs"]
 mod menu_overflow_ui;
@@ -2443,25 +2441,6 @@ fn settings_save_to_config_and_are_read_on_startup(cx: &mut TestAppContext) {
 }
 
 #[gpui_kit::test]
-fn the_jev_judge_toggle_persists_to_config(cx: &mut TestAppContext) {
-    let options = test_options();
-    let home = options.home.clone().unwrap();
-    let ui = open_with(cx, options.clone());
-    ui.press(cx, "cmd-,");
-    assert!(ui.read(cx, |app, _| app.settings_form.is_some()));
-    assert!(ui.read(cx, |app, _| app.settings.jev_judge));
-    ui.scroll_settings(cx);
-    // The Off segment is the second one in the JEV row.
-    ui.click(cx, ("settings-jev", 1usize));
-    ui.click(cx, "settings-save");
-    assert!(ui.read(cx, |app, _| app.settings_form.is_none()));
-    let saved = std::fs::read_to_string(home.join("config.toml")).unwrap();
-    assert!(saved.contains("jev_judge = false"), "{saved}");
-    let again = open_with(cx, options);
-    assert!(!again.read(cx, |app, _| app.settings.jev_judge));
-}
-
-#[gpui_kit::test]
 fn subagent_cards_expand_child_activity_and_route_approvals(cx: &mut TestAppContext) {
     let options = test_options();
     let ui = open_with(cx, options.clone());
@@ -4536,7 +4515,6 @@ fn narrow_settings_scrolling_reaches_every_row_hint_without_moving_actions(
             "Base URL",
             "API key env",
             "API key file",
-            "JEV judge",
             "Approval",
             "Queued work",
         ]);
@@ -4669,38 +4647,6 @@ fn context_compaction_shows_a_row(cx: &mut TestAppContext) {
             before_tokens: 92_000,
             after_tokens: 41_000
         })
-    );
-}
-
-#[gpui_kit::test]
-fn a_jev_verdict_shows_a_status_row(cx: &mut TestAppContext) {
-    let ui = open(cx);
-    let engine = running_turn(&ui, cx);
-    engine.send(
-        cx,
-        AgentEvent::JevVerdict {
-            question: flint_agent::JevQuestion::Verified,
-            probability: 0.72,
-            confirmed: true,
-        },
-    );
-    let ix = ui.read(cx, |app, _| app.session().view.items.len() - 1);
-    let last = ui.read(cx, |app, _| app.session().view.items.last().cloned());
-    assert_eq!(
-        last,
-        Some(Item::Jev {
-            question: flint_agent::JevQuestion::Verified,
-            probability: 0.72,
-            confirmed: true,
-        })
-    );
-    // The verdict is rendered as its own row, not only folded into the model.
-    assert!(
-        ui.with(cx, |window, cx| {
-            window.render_frame(cx);
-            window.try_find(("jev", ix)).is_some()
-        }),
-        "the JEV status row should render in the transcript"
     );
 }
 

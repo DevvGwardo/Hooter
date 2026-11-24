@@ -10,8 +10,6 @@ use tokio::net::TcpListener;
 
 use std::path::PathBuf;
 
-use crate::JevQuestion;
-
 use super::*;
 
 #[path = "archive_shutdown_tests.rs"]
@@ -118,64 +116,6 @@ async fn mock_server_with_response_hook(
     (url, requests)
 }
 
-/// A one-request-per-connection stand-in for the Typesafe System One endpoint.
-/// Every POST to `/v1/systemone` is answered with the same calibrated `noul`
-/// probability, and the request bodies are recorded so a test can assert which
-/// question the harness asked.
-async fn mock_judge(probability: f64) -> (String, Arc<StdMutex<Vec<Value>>>) {
-    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
-    let base = format!("http://{}", listener.local_addr().expect("addr"));
-    let requests = Arc::new(StdMutex::new(Vec::new()));
-    let seen = Arc::clone(&requests);
-    tokio::spawn(async move {
-        while let Ok((mut socket, _)) = listener.accept().await {
-            let mut buf = Vec::new();
-            let mut chunk = [0u8; 4096];
-            let body = loop {
-                let n = socket.read(&mut chunk).await.unwrap_or(0);
-                if n == 0 {
-                    break None;
-                }
-                buf.extend_from_slice(&chunk[..n]);
-                let text = String::from_utf8_lossy(&buf).to_string();
-                let Some(split) = text.find("\r\n\r\n") else {
-                    continue;
-                };
-                let length = text[..split]
-                    .lines()
-                    .find_map(|l| {
-                        l.to_ascii_lowercase()
-                            .strip_prefix("content-length:")
-                            .map(|v| v.trim().parse::<usize>().unwrap_or(0))
-                    })
-                    .unwrap_or(0);
-                if buf.len() >= split + 4 + length {
-                    break Some(buf[split + 4..split + 4 + length].to_vec());
-                }
-            };
-            let Some(body) = body else { continue };
-            let value: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
-            seen.lock().expect("lock").push(value.clone());
-            // Answer under the name the harness asked with, the way System One
-            // echoes the question key back.
-            let name = value["questions"]
-                .as_object()
-                .and_then(|questions| questions.keys().next().cloned())
-                .unwrap_or_else(|| "stuck".to_string());
-            let mut answers = serde_json::Map::new();
-            answers.insert(name, json!({"type": "noul", "noul": probability}));
-            let reply_body = json!({"answers": Value::Object(answers)}).to_string();
-            let reply = format!(
-                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{reply_body}",
-                reply_body.len()
-            );
-            let _ = socket.write_all(reply.as_bytes()).await;
-            let _ = socket.shutdown().await;
-        }
-    });
-    (base, requests)
-}
-
 fn sse(chunks: &[Value]) -> String {
     let mut out: String = chunks.iter().map(|c| format!("data: {c}\n\n")).collect();
     out.push_str("data: [DONE]\n\n");
@@ -209,7 +149,6 @@ fn test_config(url: String, workspace: PathBuf) -> AgentConfig {
         workspace,
         general: false,
         approval: ApprovalMode::Auto,
-        jev: None,
         session_dir: None,
         // Explicit, so the mock server only sees chat requests (0 would fetch `/models`).
         context_budget_tokens: 100_000,
@@ -244,8 +183,8 @@ async fn run_one_turn(url: String, workspace: PathBuf, prompt: &str) -> Vec<Agen
     run_one_turn_config(test_config(url, workspace), prompt).await
 }
 
-/// Like [`run_one_turn`], for a config the caller has already customised (a
-/// JEV judge, an alternate model, ...).
+/// Like [`run_one_turn`], for a config the caller has already customised (an
+/// alternate model, a different approval mode, ...).
 async fn run_one_turn_config(config: AgentConfig, prompt: &str) -> Vec<AgentEvent> {
     let events = run_turns(config, &[prompt]).await;
     // Only the turn itself, as these tests were written.
@@ -318,7 +257,6 @@ fn outline(events: &[AgentEvent]) -> Vec<String> {
             )),
             AgentEvent::SessionOptions(_) | AgentEvent::SteeringAccepted { .. } => None,
             AgentEvent::SessionStopped { .. } => None,
-            AgentEvent::JevVerdict { .. } => None,
             AgentEvent::TaskUpdated { .. } | AgentEvent::TaskAssessed { .. } => None,
             AgentEvent::SubagentStarted { .. }
             | AgentEvent::SubagentWorkspace { .. }
@@ -651,116 +589,6 @@ async fn verify_nudge_fires_when_no_command_follows_an_edit() {
 }
 
 #[tokio::test]
-async fn a_jev_verdict_that_confirms_an_edit_reaches_the_event_stream() {
-    let (_guard, ws) = temp_workspace();
-    let (url, _) = mock_server(vec![
-        sse_tool_call(
-            "c1",
-            "write_file",
-            json!({"path": "a.py", "content": "x = 1\n"}),
-        ),
-        sse_text("Done."),
-        sse_text("No tests exist; nothing to run."),
-    ])
-    .await;
-    let (judge_url, judged) = mock_judge(0.1).await;
-    let mut config = test_config(url, ws);
-    config.jev = Some(crate::JevConfig {
-        api_key: "judge-key".to_string(),
-        base_url: judge_url,
-        model: "jev-test".to_string(),
-    });
-    let events = run_one_turn_config(config, "fix the value in a.py").await;
-
-    assert_eq!(
-        events.iter().find_map(|event| match event {
-            AgentEvent::JevVerdict {
-                question,
-                probability,
-                confirmed,
-            } => Some((*question, *probability, *confirmed)),
-            _ => None,
-        }),
-        Some((JevQuestion::Verified, 0.1, true))
-    );
-    assert!(events.iter().any(|event| matches!(
-        event,
-        AgentEvent::HarnessNudge {
-            reason: NudgeReason::Verify,
-            ..
-        }
-    )));
-
-    let judged = judged.lock().expect("judge requests").clone();
-    assert_eq!(judged.len(), 1);
-    assert_eq!(judged[0]["model"], "jev-test");
-    assert_eq!(
-        judged[0]["questions"]
-            .as_object()
-            .expect("questions")
-            .keys()
-            .collect::<Vec<_>>(),
-        vec!["verified"]
-    );
-}
-
-#[tokio::test]
-async fn a_jev_verdict_cannot_skip_deterministic_verification_after_observed_edits() {
-    let (_guard, ws) = temp_workspace();
-    let (url, _) = mock_server(vec![
-        sse_tool_call(
-            "c1",
-            "write_file",
-            json!({"path": "a.py", "content": "x = 1\n"}),
-        ),
-        sse_text("Done."),
-        sse_text("Done, still unverified."),
-    ])
-    .await;
-    let (judge_url, judged) = mock_judge(0.9).await;
-    let mut config = test_config(url, ws);
-    config.jev = Some(crate::JevConfig {
-        api_key: "judge-key".to_string(),
-        base_url: judge_url,
-        model: "jev-test".to_string(),
-    });
-    let events = run_one_turn_config(config, "fix the value in a.py").await;
-
-    assert_eq!(
-        events.iter().find_map(|event| match event {
-            AgentEvent::JevVerdict {
-                question,
-                probability,
-                confirmed,
-            } => Some((*question, *probability, *confirmed)),
-            _ => None,
-        }),
-        Some((JevQuestion::Verified, 0.9, false))
-    );
-    assert!(events.iter().any(|event| matches!(
-        event,
-        AgentEvent::HarnessNudge {
-            reason: NudgeReason::Verify,
-            ..
-        }
-    )));
-    assert_eq!(
-        outline(&events),
-        vec![
-            "turn",
-            "step 0",
-            "call write_file a.py",
-            "done ok=true",
-            "step 1",
-            "nudge Verify",
-            "step 2",
-            "finished Completed",
-        ]
-    );
-    assert_eq!(judged.lock().expect("judge requests").len(), 1);
-}
-
-#[tokio::test]
 async fn blocked_turn_still_catches_leaked_tool_call_and_failed_check() {
     let (_guard, ws) = temp_workspace();
     let (url, _) = mock_server(vec![
@@ -795,54 +623,6 @@ async fn blocked_turn_still_catches_leaked_tool_call_and_failed_check() {
             ..
         }
     )));
-}
-
-#[tokio::test]
-async fn a_jev_verdict_on_a_stuck_loop_reaches_the_event_stream() {
-    let (_guard, ws) = temp_workspace();
-    std::fs::write(ws.join("a.txt"), "hi\n").expect("seed file");
-    let (url, _) = mock_server(vec![
-        sse_tool_call("r1", "read_file", json!({"path": "a.txt"})),
-        sse_tool_call("r2", "read_file", json!({"path": "a.txt"})),
-        sse_text("It says hi."),
-    ])
-    .await;
-    let (judge_url, judged) = mock_judge(0.9).await;
-    let mut config = test_config(url, ws);
-    config.jev = Some(crate::JevConfig {
-        api_key: "judge-key".to_string(),
-        base_url: judge_url,
-        model: "jev-test".to_string(),
-    });
-    let events = run_one_turn_config(config, "what does a.txt say?").await;
-
-    assert!(
-        events.iter().any(|event| matches!(
-            event,
-            AgentEvent::JevVerdict {
-                question: JevQuestion::Stuck,
-                confirmed: true,
-                ..
-            }
-        )),
-        "the stuck verdict should reach the stream: {events:?}"
-    );
-    assert!(events.iter().any(|event| matches!(
-        event,
-        AgentEvent::HarnessNudge {
-            reason: NudgeReason::Stuck,
-            ..
-        }
-    )));
-    let judged = judged.lock().expect("judge requests").clone();
-    assert_eq!(
-        judged[0]["questions"]
-            .as_object()
-            .expect("questions")
-            .keys()
-            .collect::<Vec<_>>(),
-        vec!["stuck"]
-    );
 }
 
 #[tokio::test]

@@ -4,8 +4,6 @@ use super::KeySources;
 use super::KeyStatus;
 use super::Settings;
 use super::display_path;
-use super::jev_key_set;
-use super::key_with_typesafe_fallback;
 use flint_agent::ApprovalMode;
 
 #[test]
@@ -417,112 +415,6 @@ fn environment_keys_come_from_the_injected_lookup() {
         (found.key.as_str(), found.source.as_str()),
         ("env-key", "$OPENAI_API_KEY")
     );
-}
-
-#[test]
-fn typesafe_private_file_fallback_is_trimmed_and_scoped_to_the_judge() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let file = dir.path().join("typesafe.key");
-    std::fs::write(&file, "  fixture-typesafe-key\n").expect("write");
-    assert_eq!(
-        key_with_typesafe_fallback("TYPESAFE_API_KEY", None, &file).as_deref(),
-        Some("fixture-typesafe-key")
-    );
-    for name in ["FLINT_API_KEY", "OPENAI_API_KEY", "OTHER_PROVIDER_KEY"] {
-        assert!(key_with_typesafe_fallback(name, None, &file).is_none());
-    }
-    assert_eq!(
-        key_with_typesafe_fallback(
-            "TYPESAFE_API_KEY",
-            Some("  environment-override  ".into()),
-            &file,
-        )
-        .as_deref(),
-        Some("environment-override")
-    );
-    std::fs::write(&file, " \n").expect("empty");
-    assert!(key_with_typesafe_fallback("TYPESAFE_API_KEY", None, &file).is_none());
-    assert!(!jev_key_set(&KeySources::none()));
-}
-
-#[test]
-fn typesafe_judge_uses_injected_credentials_without_changing_the_model_key() {
-    let sources = KeySources {
-        env: |name| match name {
-            "OPENAI_API_KEY" => Some("fixture-model-key".into()),
-            "TYPESAFE_API_KEY" => Some("fixture-judge-key".into()),
-            _ => None,
-        },
-        ..KeySources::none()
-    };
-    assert!(jev_key_set(&sources));
-    let dir = tempfile::tempdir().expect("tempdir");
-    let config = crate::engine::config_for(
-        dir.path(),
-        &Settings::default(),
-        None,
-        &sources,
-        ApprovalMode::Auto,
-    )
-    .expect("config");
-    assert_eq!(config.api_key, "fixture-model-key");
-    assert_eq!(config.jev.expect("judge").api_key, "fixture-judge-key");
-}
-
-#[test]
-fn the_jev_judge_defaults_on_and_missing_configs_keep_it_on() {
-    assert!(Settings::default().jev_judge);
-    // A config written before the toggle existed has no `jev_judge` key and
-    // must keep the judge enabled.
-    let old: Settings = toml::from_str("model = \"old\"\n").expect("parse");
-    assert!(old.jev_judge);
-    let dir = tempfile::tempdir().expect("tempdir");
-    Settings::default().save(dir.path()).expect("save");
-    let loaded = Settings::load(dir.path(), &KeySources::none());
-    assert!(loaded.jev_judge);
-}
-
-#[test]
-fn turning_off_the_jev_judge_drops_it_from_the_engine_config() {
-    let sources = KeySources {
-        env: |name| match name {
-            "OPENAI_API_KEY" => Some("fixture-model-key".into()),
-            "TYPESAFE_API_KEY" => Some("fixture-judge-key".into()),
-            _ => None,
-        },
-        ..KeySources::none()
-    };
-    let dir = tempfile::tempdir().expect("tempdir");
-    let settings = Settings {
-        jev_judge: false,
-        ..Settings::default()
-    };
-    let config =
-        crate::engine::config_for(dir.path(), &settings, None, &sources, ApprovalMode::Auto)
-            .expect("config");
-    assert!(
-        config.jev.is_none(),
-        "a disabled judge must not reach the engine even with a credential set"
-    );
-}
-
-#[test]
-fn enabling_jev_without_a_typesafe_key_keeps_the_heuristic_harness() {
-    let sources = KeySources {
-        env: |name| (name == "OPENAI_API_KEY").then(|| "fixture-model-key".into()),
-        ..KeySources::none()
-    };
-    let dir = tempfile::tempdir().expect("tempdir");
-    let config = crate::engine::config_for(
-        dir.path(),
-        &Settings::default(),
-        None,
-        &sources,
-        ApprovalMode::Auto,
-    )
-    .expect("config");
-    assert!(config.jev.is_none());
-    assert!(!jev_key_set(&sources));
 }
 
 #[test]

@@ -53,13 +53,6 @@ pub(super) struct Subagents {
 }
 
 impl Subagents {
-    pub fn set_jev(&mut self, config: Option<crate::JevConfig>) {
-        self.config.jev = config.clone();
-        for child in self.children.values_mut() {
-            child.session.stage_jev(config.clone());
-        }
-    }
-
     pub fn new(config: AgentConfig, tools: ToolContext, mcp: Option<Arc<McpHub>>) -> Self {
         let mut saved = HashMap::new();
         let mut next_id = 1;

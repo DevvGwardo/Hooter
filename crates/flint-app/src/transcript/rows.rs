@@ -4,7 +4,6 @@
 
 use std::time::Duration;
 
-use flint_agent::JevQuestion;
 use flint_agent::NudgeReason;
 use flint_agent::ToolKind;
 use gpui_kit::assets::IconName;
@@ -63,11 +62,6 @@ pub fn render(
             message,
             expanded,
         } => nudge(target, ix, *reason, message, *expanded, cx).into_any_element(),
-        Item::Jev {
-            question,
-            probability,
-            confirmed,
-        } => jev(ix, *question, *probability, *confirmed).into_any_element(),
         Item::Compacted {
             before_tokens,
             after_tokens,
@@ -608,46 +602,6 @@ fn is_exit_code_line(line: &str) -> bool {
         && line.ends_with(']')
 }
 
-/// The optional JEV judge's verdict on a guard suspicion: what it judged, how
-/// confident it was, and whether the guard acted on it. Cleared suspicions are
-/// neutral execution evidence, not task acceptance.
-fn jev(ix: usize, question: JevQuestion, probability: f64, confirmed: bool) -> impl IntoElement {
-    let subject = match question {
-        JevQuestion::Stuck => "loop check",
-        JevQuestion::Verified => "verification",
-        JevQuestion::Watchdog => "edit check",
-        JevQuestion::BlockerRecovery => "blocker check",
-    };
-    let status = match (question, confirmed) {
-        (JevQuestion::Stuck, true) => "stuck",
-        (JevQuestion::Stuck, false) => "moving",
-        (JevQuestion::Verified, true) => "unverified",
-        (JevQuestion::Verified, false) => "verified",
-        (JevQuestion::Watchdog, true) => "edits still needed",
-        (JevQuestion::Watchdog, false) => "no edits needed",
-        (JevQuestion::BlockerRecovery, true) => "investigate further",
-        (JevQuestion::BlockerRecovery, false) => "no recovery advised",
-    };
-    let (icon, color) = guard_style(confirmed);
-    let label = format!("JEV · {subject} · {:.0}% · {status}", probability * 100.0);
-    bullet(
-        ui::icon(icon, 12., color),
-        ui::label(label.clone(), size::SM, color),
-    )
-    .id(("jev", ix))
-    .aria_label(label)
-    .test_support()
-}
-
-fn guard_style(intervened: bool) -> (IconName, Hsla) {
-    let p = palette();
-    if intervened {
-        (IconName::ShieldAlert, p.warning)
-    } else {
-        (IconName::ShieldCheck, p.text_subtle)
-    }
-}
-
 fn nudge(
     target: &Conversation,
     ix: usize,
@@ -716,15 +670,3 @@ fn nudge(
 #[cfg(test)]
 #[path = "rows_tests.rs"]
 mod tests;
-
-#[cfg(test)]
-mod guard_tests {
-    use super::{guard_style, palette};
-
-    #[test]
-    fn cleared_verdicts_are_neutral_and_interventions_keep_their_warning() {
-        let p = palette();
-        assert_eq!(guard_style(false).1, p.text_subtle);
-        assert_eq!(guard_style(true).1, p.warning);
-    }
-}

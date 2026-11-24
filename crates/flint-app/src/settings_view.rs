@@ -1,5 +1,5 @@
-//! The Settings sheet: model, endpoint, key status (never the key), the JEV
-//! toggle, default approval mode, reasoning effort and theme, saved to
+//! The Settings sheet: model, endpoint, key status (never the key), default
+//! approval mode, reasoning effort and theme, saved to
 //! `~/.flint/config.toml`.
 
 use flint_agent::ApprovalMode;
@@ -36,7 +36,6 @@ pub struct SettingsForm {
     pub approval: ApprovalMode,
     pub effort: Option<ReasoningEffort>,
     pub transcript_width: settings::TranscriptWidth,
-    pub jev_judge: bool,
     pub queue_after_verification: bool,
     pub auto_continue_fixes: bool,
     pub error: Option<String>,
@@ -61,7 +60,6 @@ impl SettingsForm {
         draft.api_key_file = self.api_key_file.read(cx).value().trim().to_string();
         draft.api_key_env = self.api_key_env.read(cx).value().trim().to_string();
         draft.transcript_width = self.transcript_width;
-        draft.jev_judge = self.jev_judge;
         draft.queue_after_verification = self.queue_after_verification;
         draft.auto_continue_fixes = self.auto_continue_fixes;
         draft
@@ -278,7 +276,6 @@ impl FlintApp {
             approval: self.approval,
             effort: self.effort,
             transcript_width: self.settings.transcript_width,
-            jev_judge: self.settings.jev_judge,
             queue_after_verification: self.settings.queue_after_verification,
             auto_continue_fixes: self.settings.auto_continue_fixes,
             error: None,
@@ -360,14 +357,10 @@ impl FlintApp {
         let width_changed = self.settings.transcript_width != next.transcript_width;
         let queue_policy_changed =
             self.settings.queue_after_verification != next.queue_after_verification;
-        let jev_changed = self.settings.jev_judge != next.jev_judge;
         let auto_continue_disabled = self.settings.auto_continue_fixes && !next.auto_continue_fixes;
         self.settings = next;
         if auto_continue_disabled {
             self.pause_auto_continuations();
-        }
-        if jev_changed {
-            self.broadcast_jev();
         }
         if width_changed {
             self.remeasure_chat_layout(cx);
@@ -381,41 +374,6 @@ impl FlintApp {
             }
         }
         self.close_settings(window, cx);
-    }
-
-    /// Save the preference and stage it for existing native engines' next turn.
-    pub fn toggle_jev_judge(&mut self, cx: &mut Context<Self>) {
-        if self.session().agent != flint_agent::AgentKind::Flint || self.settings_form.is_some() {
-            return;
-        }
-        let mut next = self.settings.clone();
-        next.jev_judge = !next.jev_judge;
-        if let Err(err) = next.save(&self.home) {
-            self.store_error = Some(format!("Couldn't save JEV setting: {err}"));
-            cx.notify();
-            return;
-        }
-        self.settings = next;
-        self.broadcast_jev();
-        if self
-            .store_error
-            .as_deref()
-            .is_some_and(|error| error.starts_with("Couldn't save JEV setting:"))
-        {
-            self.store_error = None;
-        }
-        cx.notify();
-    }
-
-    fn broadcast_jev(&mut self) {
-        let config = crate::engine::jev_config(&self.settings, &self.key_sources);
-        for session in &self.sessions {
-            if session.agent == flint_agent::AgentKind::Flint
-                && let Some(ops) = &session.ops
-            {
-                ops.try_send(flint_agent::Op::SetJev(config.clone())).ok();
-            }
-        }
     }
 
     pub fn toggle_auto_continue_fixes(&mut self, cx: &mut Context<Self>) {
@@ -537,16 +495,6 @@ pub fn render(
                 p.danger,
             ),
         };
-    let (jev_text, jev_color) = if !form.jev_judge {
-        (
-            "Off — the harness uses its own heuristics only",
-            p.text_subtle,
-        )
-    } else if settings::jev_key_set(&app.key_sources) {
-        ("On — TypeSafe credential found", p.success)
-    } else {
-        ("On, waiting for a TypeSafe key", p.text_subtle)
-    };
     let approvals = [
         (ApprovalMode::Auto, "Auto-run"),
         (ApprovalMode::AskForChanges, "Ask before changes"),
@@ -915,40 +863,6 @@ pub fn render(
                         .label("Keep provider")
                         .on_click(cx.listener(|app, _, _, cx| app.stage_provider_profile(cx))),
                 ),
-        ))
-        .child(row(
-            "JEV judge",
-            Some("Applies on the next native turn"),
-            div()
-                .flex()
-                .flex_col()
-                .gap(px(8.))
-                .child(div().flex().gap(px(6.)).children(
-                    [(true, "On"), (false, "Off")].into_iter().enumerate().map(
-                        |(n, (on, label))| {
-                            segment(("settings-jev", n), label, form.jev_judge == on)
-                                .aria_label(format!("JEV judge {label}"))
-                                .aria_toggled(if form.jev_judge == on {
-                                    Toggled::True
-                                } else {
-                                    Toggled::False
-                                })
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    if let Some(form) = &mut this.settings_form {
-                                        form.jev_judge = on;
-                                    }
-                                    cx.notify();
-                                }))
-                                .test_support()
-                        },
-                    ),
-                ))
-                .child(ui::label(jev_text, size::BASE - 1., jev_color))
-                .child(ui::label(
-                    "Requires TYPESAFE_API_KEY or $FLINT_HOME/keys/typesafe.key. Applies on the next native turn.",
-                    size::XS,
-                    p.text_subtle,
-                )),
         ))
         .child(row(
             "Approval",

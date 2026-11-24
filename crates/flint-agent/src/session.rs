@@ -23,7 +23,6 @@ use crate::harness::Harness;
 use crate::harness::args::RepairedArgs;
 use crate::harness::args::closest_tool_name;
 use crate::harness::args::repair_tool_args;
-use crate::harness::jev::JevClient;
 use crate::mcp::McpHub;
 use crate::persist;
 use crate::persist::Saver;
@@ -36,7 +35,6 @@ use crate::protocol::ApprovalMode;
 use crate::protocol::FALLBACK_CONTEXT_WINDOW_TOKENS;
 use crate::protocol::IMPROVEMENT_OPTION_ID;
 use crate::protocol::ImageAttachment;
-use crate::protocol::JevConfig;
 use crate::protocol::NudgeReason;
 use crate::protocol::Op;
 use crate::protocol::ReasoningEffort;
@@ -92,7 +90,6 @@ pub(crate) async fn run(
     // Shutdown/closed intake should abandon startup and its owned servers.
     let shutdown = CancellationToken::new();
     let effort = Arc::new(Mutex::new(config.reasoning_effort));
-    let jev_settings = Arc::new(Mutex::new(config.jev.clone()));
     let approvals = Arc::new(Approvals::default());
     let stopping = Arc::new(AtomicBool::new(false));
     let tools = tools::ToolContext::new(config.workspace.clone(), config.sandbox);
@@ -102,7 +99,6 @@ pub(crate) async fn run(
     // running turn, and user messages queue while one is in flight.
     let ops_current = Arc::clone(&current);
     let ops_effort = Arc::clone(&effort);
-    let ops_jev = Arc::clone(&jev_settings);
     let ops_approvals = Arc::clone(&approvals);
     let ops_stopping = Arc::clone(&stopping);
     let ops_shutdown = shutdown.clone();
@@ -195,9 +191,6 @@ pub(crate) async fn run(
                         *slot = level;
                     }
                 }
-                Op::SetJev(config) => {
-                    *ops_jev.lock().unwrap_or_else(|error| error.into_inner()) = config;
-                }
                 Op::SetSessionOption { id, value } => {
                     if id == IMPROVEMENT_OPTION_ID {
                         let _ = messages_tx.send(Input::ImprovementPolicy(value)).await;
@@ -237,7 +230,6 @@ pub(crate) async fn run(
         false,
         Ok(saver),
     );
-    session.jev_settings = jev_settings;
     session.initialize_improvements(options.improvement_hints);
     if !options.allow_subagents {
         session.subagents = None;
@@ -460,8 +452,6 @@ pub(super) struct Session {
     approval: ApprovalMode,
     config: AgentConfig,
     provider: Provider,
-    jev: Option<JevClient>,
-    jev_settings: Arc<Mutex<Option<JevConfig>>>,
     pub(super) history: Vec<Message>,
     pub(super) events: Sender<AgentEvent>,
     approvals: Arc<Approvals>,
@@ -650,28 +640,6 @@ impl Session {
         });
     }
 
-    pub(super) fn stage_jev(&mut self, config: Option<JevConfig>) {
-        *self
-            .jev_settings
-            .lock()
-            .unwrap_or_else(|error| error.into_inner()) = config;
-    }
-
-    fn apply_jev_settings(&mut self) {
-        let config = self
-            .jev_settings
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .clone();
-        if config != self.config.jev {
-            self.jev = config.clone().map(JevClient::new);
-            self.config.jev = config.clone();
-            if let Some(children) = &mut self.subagents {
-                children.set_jev(config);
-            }
-        }
-    }
-
     pub(super) fn new(
         config: AgentConfig,
         events: Sender<AgentEvent>,
@@ -754,8 +722,6 @@ impl Session {
         Self {
             subagents: (!child).then(|| Subagents::new(config.clone(), tools.child(), mcp.clone())),
             provider: Provider::new(&config.base_url, &config.model, &config.api_key),
-            jev: config.jev.clone().map(JevClient::new),
-            jev_settings: Arc::new(Mutex::new(config.jev.clone())),
             context: ContextTracker::new(
                 if config.context_budget_tokens == 0 {
                     budget_for_window(None)
@@ -1199,7 +1165,6 @@ impl Session {
             }
             return reason;
         }
-        self.apply_jev_settings();
         self.turn_id += 1;
         let turn_id = self.turn_id;
         self.emit(AgentEvent::TurnStarted { turn_id });
@@ -1277,7 +1242,7 @@ impl Session {
             .task
             .as_ref()
             .map_or(text.as_str(), |task| task.contract.objective.as_str());
-        let mut harness = Harness::new(goal, self.jev.clone());
+        let mut harness = Harness::new(goal);
         if let Some(task) = &self.task {
             harness.set_task_record(task);
         }
@@ -1300,11 +1265,10 @@ impl Session {
             if let Some(task) = &self.task {
                 harness.set_task_record(task);
             }
-            let stuck = tokio::select! {
-                _ = cancel.cancelled() => return TurnEndReason::Interrupted,
-                stuck = harness.before_step() => stuck,
-            };
-            self.emit_jev_verdicts(&mut harness);
+            if cancel.is_cancelled() {
+                return TurnEndReason::Interrupted;
+            }
+            let stuck = harness.before_step();
             if let Some(nudge) = stuck {
                 self.nudge(NudgeReason::Stuck, nudge);
             }
@@ -1439,11 +1403,10 @@ impl Session {
                     harness.set_task_record(task);
                 }
                 let names = self.tool_name_refs();
-                let decision = tokio::select! {
-                    _ = cancel.cancelled() => return TurnEndReason::Interrupted,
-                    decision = harness.finish_decision(&completion.text, &names) => decision,
-                };
-                self.emit_jev_verdicts(&mut harness);
+                if cancel.is_cancelled() {
+                    return TurnEndReason::Interrupted;
+                }
+                let decision = harness.finish_decision(&completion.text, &names);
                 match decision {
                     FinishDecision::Continue { reason, message } => {
                         self.nudge(reason, message);
@@ -1520,18 +1483,6 @@ impl Session {
             message: message.clone(),
         });
         self.history.push(Message::Nudge(message));
-    }
-
-    /// Surfaces the judge's verdicts on the harness's suspicions to the front
-    /// end, so a guard decision can show whether the judge backed it.
-    fn emit_jev_verdicts(&self, harness: &mut Harness) {
-        for verdict in harness.take_jev_verdicts() {
-            self.emit(AgentEvent::JevVerdict {
-                question: verdict.question,
-                probability: verdict.probability,
-                confirmed: verdict.confirmed,
-            });
-        }
     }
 
     /// Repairs the tool name and arguments of a raw call.

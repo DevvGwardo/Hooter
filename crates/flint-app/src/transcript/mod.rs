@@ -347,9 +347,7 @@ fn row_spacing(item: &Item) -> f32 {
         Item::Assistant { .. } => 20.,
         Item::Thinking { .. } => 18.,
         Item::Tool(_) | Item::Repair { .. } => 10.,
-        Item::Nudge { .. } | Item::Jev { .. } | Item::Compacted { .. } | Item::Reverted { .. } => {
-            12.
-        }
+        Item::Nudge { .. } | Item::Compacted { .. } | Item::Reverted { .. } => 12.,
         Item::Approval { .. } | Item::Error(_) => 18.,
         Item::TurnSummary { .. } => 24.,
     }

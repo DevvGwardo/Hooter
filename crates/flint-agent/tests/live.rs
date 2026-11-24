@@ -69,7 +69,6 @@ fn live_creates_and_tests_add_py() {
             }
             AgentEvent::SessionOptions(_)
             | AgentEvent::SessionStopped { .. }
-            | AgentEvent::JevVerdict { .. }
             | AgentEvent::FilesReverted { .. } => {}
             AgentEvent::SubagentStarted { .. }
             | AgentEvent::SubagentWorkspace { .. }

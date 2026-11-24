@@ -17,12 +17,7 @@ async fn main() -> anyhow::Result<()> {
         anyhow::bail!("usage: headless <dir> <prompt>");
     };
     let config = AgentConfig::from_env(PathBuf::from(dir))?;
-    eprintln!(
-        "model {} at {}  jev={}",
-        config.model,
-        config.base_url,
-        config.jev.is_some()
-    );
+    eprintln!("model {} at {}", config.model, config.base_url);
     let handle = flint_agent::spawn_session(config);
     handle.ops.send(Op::UserMessage(prompt)).await?;
     let mut in_text = false;
@@ -83,15 +78,6 @@ async fn main() -> anyhow::Result<()> {
             }
             AgentEvent::ApprovalRequested { summary, .. } => format!("? approval: {summary}"),
             AgentEvent::HarnessNudge { reason, .. } => format!("⚑ harness nudge: {reason:?}"),
-            AgentEvent::JevVerdict {
-                question,
-                probability,
-                confirmed,
-            } => format!(
-                "◇ jev {question:?}: {:.0}% {}",
-                probability * 100.0,
-                if *confirmed { "confirmed" } else { "cleared" }
-            ),
             AgentEvent::ToolRepaired { tool, detail } => format!("⚒ repaired {tool}: {detail}"),
             AgentEvent::Usage(u) => format!(
                 "  usage in={} cached={} out={} reasoning={}",

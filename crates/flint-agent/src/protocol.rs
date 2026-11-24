@@ -24,8 +24,6 @@ pub struct AgentConfig {
     /// General-purpose assistance rather than assuming a coding project.
     pub general: bool,
     pub approval: ApprovalMode,
-    /// Optional JEV judge; `None` keeps the harness on its heuristics.
-    pub jev: Option<JevConfig>,
     /// Where the conversation is saved (`history.json`) and restored from.
     /// `None` keeps the session in memory only.
     pub session_dir: Option<PathBuf>,
@@ -92,13 +90,6 @@ pub enum ApprovalMode {
     AskForChanges,
 }
 
-#[derive(Clone, PartialEq, Eq)]
-pub struct JevConfig {
-    pub api_key: String,
-    pub base_url: String,
-    pub model: String,
-}
-
 impl std::fmt::Debug for AgentConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AgentConfig")
@@ -109,7 +100,6 @@ impl std::fmt::Debug for AgentConfig {
             .field("workspace", &self.workspace)
             .field("general", &self.general)
             .field("approval", &self.approval)
-            .field("jev", &self.jev)
             .field("session_dir", &self.session_dir)
             .field("context_budget_tokens", &self.context_budget_tokens)
             .field("reasoning_effort", &self.reasoning_effort)
@@ -120,54 +110,6 @@ impl std::fmt::Debug for AgentConfig {
             )
             .finish()
     }
-}
-
-impl std::fmt::Debug for JevConfig {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("JevConfig")
-            .field("api_key", &"<redacted>")
-            .field("base_url", &self.base_url)
-            .field("model", &self.model)
-            .finish()
-    }
-}
-
-/// Which harness suspicion the JEV judge ruled on.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum JevQuestion {
-    /// Is the turn looping — repeating an action or failure without progress?
-    Stuck,
-    /// Is the turn's work actually verified by a check that ran after the edits?
-    Verified,
-    /// Does the task still need file changes?
-    Watchdog,
-    /// Can a claimed informational blocker be investigated within existing scope?
-    BlockerRecovery,
-}
-
-impl JevQuestion {
-    /// The question's wire key, also carried by [`JevVerdict`].
-    pub fn name(self) -> &'static str {
-        match self {
-            JevQuestion::Stuck => "stuck",
-            JevQuestion::Verified => "verified",
-            JevQuestion::Watchdog => "watchdog",
-            JevQuestion::BlockerRecovery => "blocker_recovery",
-        }
-    }
-}
-
-/// The optional JEV judge's verdict on one harness suspicion, surfaced to a
-/// front end so a guard decision can carry its judge status.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct JevVerdict {
-    pub question: JevQuestion,
-    /// Probability in `[0, 1]` that the judge answered yes.
-    pub probability: f64,
-    /// Whether the guard acted on the verdict — the suspicion was confirmed
-    /// rather than cleared.
-    pub confirmed: bool,
 }
 
 /// Front end -> engine.
@@ -204,9 +146,6 @@ pub enum Op {
     },
     /// Change the reasoning effort for later model calls (`None` = provider default).
     SetReasoningEffort(Option<ReasoningEffort>),
-    /// Native only. Apply optional judge configuration at the next turn,
-    /// without changing the running turn, task scope, or tool approvals.
-    SetJev(Option<JevConfig>),
     /// Restore the files the agent changed in its most recent turn with
     /// changes (flint's own engine; queued behind a running turn). Answered
     /// by [`AgentEvent::FilesReverted`] or an [`AgentEvent::Error`].
@@ -337,16 +276,6 @@ pub enum AgentEvent {
     HarnessNudge {
         reason: NudgeReason,
         message: String,
-    },
-    /// The optional JEV judge ruled on a harness suspicion. Shown in the
-    /// transcript so a guard decision carries its judge status.
-    JevVerdict {
-        question: JevQuestion,
-        /// Probability in `[0, 1]` that the judge answered yes.
-        probability: f64,
-        /// Whether the guard acted on the verdict — the suspicion was
-        /// confirmed rather than cleared.
-        confirmed: bool,
     },
     /// The harness fixed a malformed tool call instead of failing it.
     ToolRepaired {
@@ -533,21 +462,5 @@ mod branding_tests {
             serde_json::from_str::<AgentKind>("\"flint\"").unwrap(),
             AgentKind::Flint
         );
-    }
-}
-
-#[cfg(test)]
-mod jev_tests {
-    use super::*;
-
-    #[test]
-    fn jev_verdict_round_trips_through_serde() {
-        let event = AgentEvent::JevVerdict {
-            question: JevQuestion::Verified,
-            probability: 0.42,
-            confirmed: false,
-        };
-        let json = serde_json::to_string(&event).unwrap();
-        assert_eq!(serde_json::from_str::<AgentEvent>(&json).unwrap(), event);
     }
 }

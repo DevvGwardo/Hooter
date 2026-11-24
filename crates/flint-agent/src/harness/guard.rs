@@ -4,7 +4,7 @@
 //!   command failing twice in a row with identical output, two different
 //!   commands in a row failing with identical output, or a file re-read over
 //!   lines already read three times without editing it -> a nudge to step
-//!   back. A call seen twice becomes a *suspect* the JEV judge may confirm.
+//!   back.
 //! - Verify before done: files were edited and no real check (a command
 //!   other than ls/cat/grep/git status and the like) ran after the last edit
 //!   when the model tries to finish -> one nudge to run tests/build. If the
@@ -13,15 +13,11 @@
 //!   edited nothing, and it tries to finish -> one nudge to do the work.
 //! - Open plan: the model's `update_plan` still has open steps when it tries
 //!   to finish -> one nudge to finish or drop them.
-//!
-//! The guard also keeps a small, capped record of the turn that the JEV
-//! judges read (see the `*_state` methods).
 
 use std::collections::BTreeMap;
 use std::collections::HashMap;
 
 use serde_json::Value;
-use serde_json::json;
 
 use crate::protocol::NudgeReason;
 use crate::protocol::ToolKind;
@@ -83,36 +79,11 @@ pub fn stuck_nudge(call: &str) -> String {
     )
 }
 
-// Caps that keep every JEV state small no matter how large the arguments or
-// outputs are (small fixed values).
-const JEV_TRAILING_TOOL_CALLS: usize = 8;
-const JEV_MAX_ARGS_CHARS: usize = 240;
-const JEV_MAX_OUTPUT_CHARS: usize = 200;
-const JEV_MAX_EDITED_FILES: usize = 20;
-const JEV_MAX_PATH_CHARS: usize = 160;
-const JEV_MAX_COMMANDS: usize = 20;
-const JEV_MAX_MESSAGE_CHARS: usize = 600;
-const JEV_MAX_TASK_CHARS: usize = 1000;
-
 /// Which end-of-turn check applies.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FinishCheck {
     Verify,
     Watchdog,
-}
-
-#[derive(Debug, Clone)]
-struct TraceEntry {
-    tool: String,
-    args: String,
-    exit_code: Option<i32>,
-    output: String,
-}
-
-#[derive(Debug, Clone)]
-struct CommandEntry {
-    command: String,
-    exit_code: Option<i32>,
 }
 
 /// Tracks one user turn.
@@ -125,7 +96,6 @@ pub struct TurnGuard {
     last_failure: HashMap<String, String>,
     failure_streak: HashMap<String, u32>,
     pending_stuck: Option<String>,
-    stuck_suspect: Option<String>,
     tool_calls: u32,
     edited_files: bool,
     /// A successful shell/MCP operation may change work outside the file tools.
@@ -148,9 +118,6 @@ pub struct TurnGuard {
     watchdog_nudged: bool,
     plan_nudged: bool,
     failed_tool: bool,
-    trace: Vec<TraceEntry>,
-    edited_paths: Vec<String>,
-    commands_after_last_edit: Vec<CommandEntry>,
 }
 
 impl TurnGuard {
@@ -163,7 +130,6 @@ impl TurnGuard {
             last_failure: HashMap::new(),
             failure_streak: HashMap::new(),
             pending_stuck: None,
-            stuck_suspect: None,
             tool_calls: 0,
             edited_files: false,
             possible_changes: false,
@@ -179,9 +145,6 @@ impl TurnGuard {
             watchdog_nudged: false,
             plan_nudged: false,
             failed_tool: false,
-            trace: Vec::new(),
-            edited_paths: Vec::new(),
-            commands_after_last_edit: Vec::new(),
         }
     }
 
@@ -194,38 +157,14 @@ impl TurnGuard {
         _path: Option<&str>,
     ) {
         self.tool_calls += 1;
-        match kind {
-            ToolKind::Edit => {}
-            ToolKind::Command => {
-                if self.commands_after_last_edit.len() == JEV_MAX_COMMANDS {
-                    self.commands_after_last_edit.remove(0);
-                }
-                self.commands_after_last_edit.push(CommandEntry {
-                    command: truncate(&command_of(name, kind, args), JEV_MAX_ARGS_CHARS),
-                    exit_code: None,
-                });
-            }
-            ToolKind::Read if name == "read_file" => self.record_read(args),
-            ToolKind::Read | ToolKind::Search | ToolKind::Other => {}
+        if kind == ToolKind::Read && name == "read_file" {
+            self.record_read(args);
         }
         let key = call_key(name, args);
-        self.trace.push(TraceEntry {
-            tool: name.to_string(),
-            args: truncate(&key, JEV_MAX_ARGS_CHARS),
-            exit_code: None,
-            output: String::new(),
-        });
-        if self.trace.len() > JEV_TRAILING_TOOL_CALLS {
-            self.trace.remove(0);
-        }
         let count = self.call_counts.entry(key.clone()).or_insert(0);
         *count += 1;
-        if *count == STUCK_REPEAT_TRIGGER - 1 {
-            self.stuck_suspect = Some(key.clone());
-        }
         if *count == STUCK_REPEAT_TRIGGER {
             self.pending_stuck = Some(stuck_nudge(&key));
-            self.stuck_suspect = None;
         }
     }
 
@@ -235,7 +174,6 @@ impl TurnGuard {
         self.check_after_last_edit = false;
         self.verify_nudged = false;
         self.failed_check_nudged = false;
-        self.commands_after_last_edit.clear();
         if let Some(path) = path {
             let key = path_key(path);
             self.read_ranges.remove(&key);
@@ -245,11 +183,6 @@ impl TurnGuard {
             self.call_counts.retain(|call, _| {
                 !(call.starts_with("read_file(") && quoted.iter().any(|q| call.contains(q)))
             });
-            let path = truncate(path, JEV_MAX_PATH_CHARS);
-            if !self.edited_paths.contains(&path) && self.edited_paths.len() < JEV_MAX_EDITED_FILES
-            {
-                self.edited_paths.push(path);
-            }
         }
     }
 
@@ -276,12 +209,8 @@ impl TurnGuard {
         }
         let count = self.rereads.entry(key.clone()).or_insert(0);
         *count += 1;
-        let call = format!("read_file {key}");
-        if *count == REREAD_TRIGGER - 1 && self.pending_stuck.is_none() {
-            self.stuck_suspect = Some(call);
-        } else if count.is_multiple_of(REREAD_TRIGGER) {
-            self.pending_stuck = Some(stuck_nudge(&call));
-            self.stuck_suspect = None;
+        if count.is_multiple_of(REREAD_TRIGGER) {
+            self.pending_stuck = Some(stuck_nudge(&format!("read_file {key}")));
         }
     }
 
@@ -296,7 +225,7 @@ impl TurnGuard {
         self.contract = Some(contract.clone());
     }
 
-    /// Share the host's revision-aware evidence with the guard and JEV instead
+    /// Share the host's revision-aware evidence with the guard instead of
     /// of maintaining a contradictory, tool-name-only notion of completion.
     pub fn set_task_record(&mut self, task: &crate::task::TaskRecord) {
         self.verification_progress = self.verification_progress.max(
@@ -388,30 +317,6 @@ impl TurnGuard {
             self.check_after_last_edit = false;
             self.verify_nudged = false;
             self.failed_check_nudged = false;
-            // Keep the completing command, not checks from before its effects.
-            let current = if kind == ToolKind::Command {
-                self.commands_after_last_edit.pop()
-            } else {
-                None
-            };
-            self.commands_after_last_edit.clear();
-            self.commands_after_last_edit.extend(current);
-        }
-        let key = truncate(&call_key(name, args), JEV_MAX_ARGS_CHARS);
-        if let Some(entry) = self
-            .trace
-            .iter_mut()
-            .rev()
-            .find(|e| e.args == key && e.exit_code.is_none() && e.output.is_empty())
-        {
-            entry.exit_code = Some(exit_code.unwrap_or(if success { 0 } else { 1 }));
-            entry.output = first_meaningful_line(output);
-        }
-        if kind == ToolKind::Command
-            && let Some(last) = self.commands_after_last_edit.last_mut()
-            && last.exit_code.is_none()
-        {
-            last.exit_code = Some(exit_code.unwrap_or(if success { 0 } else { 1 }));
         }
         let command = command_of(name, kind, args);
         let verifies = crate::task::is_verification(&command)
@@ -463,18 +368,6 @@ impl TurnGuard {
     /// Nudge to inject before the next model call, if the turn looks stuck.
     pub fn take_stuck_nudge(&mut self) -> Option<String> {
         self.pending_stuck.take()
-    }
-
-    /// A loop the heuristic suspects but has not confirmed (for the stall judge).
-    pub fn take_stuck_suspect(&mut self) -> Option<String> {
-        self.stuck_suspect.take()
-    }
-
-    /// The stall judge agreed: raise the same nudge the hard trigger would.
-    pub fn confirm_stuck(&mut self, suspect: &str) {
-        if self.pending_stuck.is_none() {
-            self.pending_stuck = Some(stuck_nudge(suspect));
-        }
     }
 
     /// Which finish check applies, by preconditions only.
@@ -537,14 +430,6 @@ impl TurnGuard {
         })
     }
 
-    /// Observed file edits cannot be cleared by a speculative judge verdict
-    /// without current passing verification.
-    pub fn requires_deterministic_verification(&self) -> bool {
-        self.task
-            .as_ref()
-            .is_some_and(|task| task.observed_edits > 0 && !task.has_current_verification())
-    }
-
     /// Marks a finish nudge as sent (each fires at most once per turn).
     pub fn mark_nudged(&mut self, check: FinishCheck) {
         match check {
@@ -575,8 +460,7 @@ impl TurnGuard {
         self.factual_finish()
     }
 
-    /// Finish rules that read facts rather than guess, so they apply even
-    /// when the JEV judge has ruled on verify/watchdog: a failed last check,
+    /// Finish rules that read facts rather than guess: a failed last check,
     /// and open plan steps.
     pub fn factual_finish(&mut self) -> Option<(NudgeReason, String)> {
         if let Some((command, exit_code)) = self
@@ -602,82 +486,14 @@ impl TurnGuard {
         None
     }
 
-    /// State for the stall judge.
-    pub fn stall_state(&self) -> Value {
-        json!({
-            "tool_call_count": self.tool_calls,
-            "files_edited": self.edited_paths,
-            "recent_tool_calls": self.trace_json(),
-        })
-    }
-
-    /// State for the verify judge.
-    pub fn verify_state(&self, final_message: &str) -> Value {
-        let commands: Vec<Value> = if let Some(task) = &self.task {
-            let mut checks: Vec<_> = task
-                .checks
-                .iter()
-                .filter(|check| {
-                    check.contract_revision == task.contract.revision
-                        && check.work_revision == task.work_revision
-                })
-                .collect();
-            checks.sort_by_key(|check| check.id);
-            checks
-                .into_iter()
-                .rev()
-                .take(JEV_MAX_COMMANDS)
-                .map(|check| {
-                    json!({
-                        "command": truncate(&check.command, JEV_MAX_ARGS_CHARS),
-                        "exit_code": check.exit_code,
-                        "verification": check.verification,
-                        "state": check.state(task.contract.revision, task.work_revision),
-                    })
-                })
-                .collect()
-        } else {
-            self.commands_after_last_edit
-                .iter()
-                .map(|c| json!({"command": c.command, "exit_code": c.exit_code}))
-                .collect()
-        };
-        let mut state = json!({
-            "files_edited": self.edited_paths,
-            "commands_after_last_edit": commands,
-            "final_message": truncate(final_message, JEV_MAX_MESSAGE_CHARS),
-        });
-        if let Some(contract) = &self.contract {
-            state["task_contract"] = judge_contract(contract);
-        }
-        self.add_task_evidence(&mut state);
-        state
-    }
-
-    /// State for the watchdog judge.
-    pub fn watchdog_state(&self, final_message: &str) -> Value {
-        let mut state = json!({
-            "task": truncate(&self.user_message, JEV_MAX_TASK_CHARS),
-            "files_edited": self.edited_paths,
-            "tool_call_count": self.tool_calls,
-            "recent_tool_calls": self.trace_json(),
-            "final_message": truncate(final_message, JEV_MAX_MESSAGE_CHARS),
-        });
-        if let Some(contract) = &self.contract {
-            state["task_contract"] = judge_contract(contract);
-        }
-        self.add_task_evidence(&mut state);
-        state
-    }
-
     pub fn has_blockers(&self) -> bool {
         self.task
             .as_ref()
             .is_some_and(|task| !task.blockers.is_empty())
     }
 
-    /// A judge cannot overrule observed denials, protected requirements, or
-    /// user/child blockers. Only unsubstantiated informational claims qualify.
+    /// Deterministic recovery only: observed denials, protected requirements,
+    /// user/child blockers and failed tools never qualify.
     pub fn can_recover_blocker(&self) -> bool {
         !self.failed_tool
             && self.task.as_ref().is_some_and(|task| {
@@ -693,25 +509,6 @@ impl TurnGuard {
                     && !task.evidence_overflow
                     && task.automatic_review.is_none()
             })
-    }
-
-    pub fn blocker_state(&self, final_message: &str) -> Value {
-        let mut state = self.watchdog_state(final_message);
-        if let Some(task) = &self.task {
-            state["reported_blockers"] = json!(
-                task.blockers
-                    .iter()
-                    .take(JEV_MAX_EDITED_FILES)
-                    .map(|blocker| json!({
-                        "text": truncate(&blocker.text, JEV_MAX_TASK_CHARS),
-                        "source": blocker.source,
-                    }))
-                    .collect::<Vec<_>>()
-            );
-            state["last_successful_inspection"] = json!(task.last_inspection);
-        }
-        state["permissions_unchanged"] = json!(true);
-        state
     }
 
     fn changed_work(&self) -> bool {
@@ -733,58 +530,12 @@ impl TurnGuard {
         })
     }
 
-    fn add_task_evidence(&self, state: &mut Value) {
-        if self.possible_changes {
-            state["untracked_command_effects"] = json!(true);
-        }
-        if let Some(task) = &self.task {
-            state["current_verification_passed"] = json!(task.has_current_verification());
-            state["evidence_overflow"] = json!(task.evidence_overflow);
-            state["observed_deliverables"] = json!(
-                task.files
-                    .iter()
-                    .take(JEV_MAX_EDITED_FILES)
-                    .map(|file| json!({
-                        "path": truncate(&file.path, JEV_MAX_PATH_CHARS),
-                        "state": file.state,
-                    }))
-                    .collect::<Vec<_>>()
-            );
-        }
-    }
-
     fn watchdog_allowed(&self) -> bool {
         self.contract.as_ref().map_or_else(
             || task_asks_for_changes(&self.user_message),
             |contract| contract.mode == crate::task::TaskMode::Work,
         )
     }
-
-    fn trace_json(&self) -> Vec<Value> {
-        self.trace
-            .iter()
-            .map(|e| json!({"tool": e.tool, "args": e.args, "exit_code": e.exit_code, "output": e.output}))
-            .collect()
-    }
-}
-
-fn judge_contract(contract: &crate::task::TaskContract) -> Value {
-    json!({
-        "revision": contract.revision,
-        "objective": truncate(&contract.objective, JEV_MAX_TASK_CHARS),
-        "mode": contract.mode,
-        "requirements": contract.requirements.iter().take(JEV_MAX_EDITED_FILES).map(|requirement| {
-            json!({
-                "id": requirement.id,
-                "kind": requirement.spec.kind_label(),
-                "text": truncate(requirement.spec.text(), JEV_MAX_ARGS_CHARS),
-            })
-        }).collect::<Vec<_>>(),
-        "requirement_count": contract.requirements.len(),
-        "requirements_truncated": contract.requirements.len() > JEV_MAX_EDITED_FILES,
-        "restrictions": contract.restrictions.iter().take(JEV_MAX_EDITED_FILES)
-            .map(|text| truncate(text, JEV_MAX_ARGS_CHARS)).collect::<Vec<_>>(),
-    })
 }
 
 /// Stable key for a call: tool name + args with sorted keys and trimmed strings.
@@ -899,24 +650,6 @@ pub fn is_inspection(command: &str) -> bool {
                 }
             }
         })
-}
-
-fn truncate(text: &str, max: usize) -> String {
-    if text.chars().count() <= max {
-        return text.to_string();
-    }
-    let mut out: String = text.chars().take(max).collect();
-    out.push('…');
-    out
-}
-
-fn first_meaningful_line(output: &str) -> String {
-    let line = output
-        .lines()
-        .map(str::trim)
-        .find(|l| !l.is_empty() && !l.starts_with("[exit code"))
-        .unwrap_or_default();
-    truncate(line, JEV_MAX_OUTPUT_CHARS)
 }
 
 const CHANGE_VERBS: &[&str] = &[

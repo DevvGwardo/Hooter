@@ -17,10 +17,6 @@ path = "src/main.rs"
 name = "hooter"
 path = "src/bin/hooter.rs"
 
-[[bin]]
-name = "jevdex"
-path = "src/bin/jevdex.rs"
-
 [dependencies]
 flint-platform.workspace = true
 flint-agent.workspace = true

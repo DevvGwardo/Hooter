@@ -3,7 +3,6 @@ use std::time::Duration;
 use flint_agent::AgentEvent;
 use flint_agent::ApprovalDecision;
 use flint_agent::FileDiff;
-use flint_agent::JevQuestion;
 use flint_agent::NudgeReason;
 use flint_agent::ToolKind;
 use flint_agent::TurnEndReason;
@@ -726,46 +725,6 @@ fn approvals_and_nudges() {
                 expanded: false,
             },
         ]
-    );
-}
-
-#[test]
-fn jev_verdicts_become_transcript_rows() {
-    let mut view = SessionView::default();
-    view.fold(AgentEvent::TurnStarted { turn_id: 1 }, secs(0));
-    let change = view.fold(
-        AgentEvent::JevVerdict {
-            question: JevQuestion::Verified,
-            probability: 0.82,
-            confirmed: false,
-        },
-        secs(1),
-    );
-    assert_eq!(change.appended, 0..1);
-    assert_eq!(
-        view.items,
-        vec![Item::Jev {
-            question: JevQuestion::Verified,
-            probability: 0.82,
-            confirmed: false,
-        }]
-    );
-    // A confirmed suspicion is a warning row, not a cleared one.
-    view.fold(
-        AgentEvent::JevVerdict {
-            question: JevQuestion::Stuck,
-            probability: 0.91,
-            confirmed: true,
-        },
-        secs(2),
-    );
-    assert_eq!(
-        view.items[1],
-        Item::Jev {
-            question: JevQuestion::Stuck,
-            probability: 0.91,
-            confirmed: true,
-        }
     );
 }
 

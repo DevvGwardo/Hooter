@@ -92,14 +92,13 @@ Maintain continuous control over the agent loop with real-time steering and queu
   <img src="assets/turn_lifecycle.jpg" alt="Turn Execution Lifecycle" width="100%" style="border-radius: 10px;" />
 </p>
 
-### 5. Deterministic Harness Guard & JEV Judge
+### 5. Deterministic Harness Guard
 Cheaper, fast models often struggle with loop traps or incomplete validation. Hooter wraps the execution loop in deterministic safety guardrails:
 
 - **Loop Detection:** Detects cyclical, repetitive tool invocations and breaks out before tokens and time are wasted.
 - **Watchdog Monitor:** Detects turns where file changes were requested but no tangible edits were executed.
 - **Test-Before-Done Enforcement:** Verifies that automated test suites have been executed and passed before marking code modifications complete.
 - **Tool-Call Repair:** Intercepts and corrects malformed JSON payloads and argument signatures automatically.
-- **Optional JEV Judge:** Configure `TYPESAFE_API_KEY` to route ambiguous loop or verification states to a Typesafe JEV judge model for second-opinion verdicts.
 
 <p align="center">
   <img src="assets/harness_guard.jpg" alt="Harness Guard System" width="100%" style="border-radius: 10px;" />
@@ -263,9 +262,9 @@ cargo run -p flint-app -- --demo
 ```
 
 ### Binaries & Aliases
-The primary binary is `hooter`. Legacy aliases `flint` and `jevdex` remain fully supported:
+The primary binary is `hooter`. The legacy alias `flint` remains fully supported:
 - `/agent hooter` (selects native agent)
-- Legacy commands: `/agent flint`, `/agent jevdex`
+- Legacy command: `/agent flint`
 - User data and sessions reside in `~/.flint/` (or `%USERPROFILE%\.flint` on Windows)
 
 ---
@@ -286,7 +285,6 @@ api_key_env = "OPENAI_API_KEY"        # Alternatively: api_key_file = "~/.config
 approval = "auto"                     # "auto" (autonomous) or "ask" (prompt on edit/exec)
 effort = "medium"                     # "low", "medium", "high", or "" for provider default
 queue_after_verification = false      # Automatically advance queued prompts when checks pass
-jev_judge = false                     # Enable Typesafe JEV second-opinion judge
 ```
 
 ### Provider Compatibility Matrix
@@ -333,7 +331,6 @@ point **API key file** at a file containing it. See
 - `FLINT_BASE_URL`: Overrides the endpoint URL.
 - `FLINT_MODEL`: Overrides the primary agent model.
 - `FLINT_SUBAGENT_MODEL`: Overrides the subagent model selection.
-- `TYPESAFE_API_KEY` / `JEV_MODEL`: Configures the Typesafe JEV judge.
 
 ---
 

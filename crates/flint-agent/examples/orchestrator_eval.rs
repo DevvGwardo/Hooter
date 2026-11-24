@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use flint_agent::{
-    AgentConfig, AgentEvent, ApprovalMode, ExecutionOptions, JevConfig, Op, ReasoningEffort,
+    AgentConfig, AgentEvent, ApprovalMode, ExecutionOptions, Op, ReasoningEffort,
     spawn_session_with_options,
 };
 use serde::Deserialize;
@@ -20,7 +20,6 @@ struct Run {
     proxy_key: String,
     prompt: String,
     allow_subagents: bool,
-    judge: bool,
     timeout_secs: u64,
     denied_read_canary: PathBuf,
 }
@@ -55,15 +54,6 @@ async fn main() -> anyhow::Result<()> {
     config.subagent_model = Some(run.model.clone());
     config.reasoning_effort = Some(ReasoningEffort::Low);
     config.context_budget_tokens = 64_000;
-    config.jev = run.judge.then(|| JevConfig {
-        base_url: run
-            .base_url
-            .trim_end_matches('/')
-            .trim_end_matches("/v1")
-            .to_string(),
-        model: run.model,
-        api_key: run.proxy_key,
-    });
     let handle = spawn_session_with_options(
         config,
         ExecutionOptions {

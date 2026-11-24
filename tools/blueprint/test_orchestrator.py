@@ -46,7 +46,7 @@ class ResumeTests(unittest.TestCase):
                            "token_bound_breached": False, "safety_halted": False},
                 "checks": [{"name": "Relevant source stayed unchanged", "passed": True}],
                 "gateway": {"url": args.gateway, "key_name": args.gateway_key_name},
-                "planned_scenarios": len(CASES) * 3 * args.trials, "results": [
+                "planned_scenarios": len(CASES) * len(evaluation.VARIANTS) * args.trials, "results": [
                     {"id": "parallel-changes-0-single", "task": "parallel-changes",
                      "trial": 0, "variant": "single", "score": {"passed": False},
                      "proxy": {"requests": [{"kind": "agent", "status": "ok"}]}},
@@ -364,6 +364,38 @@ class ContainmentAndGraderTests(unittest.TestCase):
             self.assertFalse(result["passed"])
 
 
+class ReportShapeTests(unittest.TestCase):
+    def row(self):
+        return {"id": "bugfix-pages-0-single", "task": "bugfix-pages",
+                "variant": "single", "trial": 0, "process": {"seconds": 1.5},
+                "score": {"passed": True, "false_completion": False},
+                "grader": {"passed": True, "tests_run": 4},
+                "metrics": {"outcome": "needs_review", "counts": {}},
+                "proxy": {"requests": [{"kind": "agent", "status": "ok"}]},
+                "delegation_observed": 0,
+                "events": str(Path(tempfile.gettempdir()) / "events.jsonl")}
+
+    def test_removed_gemini_judge_variant_is_not_offered(self):
+        self.assertEqual(evaluation.VARIANTS, ("single", "delegated"))
+        self.assertNotIn("delegated-gemini-judge", evaluation.parser().format_help())
+
+    def test_summary_and_page_carry_no_judge_metrics(self):
+        report = {"live": False, "results": [self.row()],
+                  "checks": [], "summary": evaluation.summarize([self.row()]),
+                  "source_sha256": "source", "fixture_sha256": "fixtures",
+                  "bridge_sha256": "bridge"}
+        self.assertEqual(set(report["summary"]), {"single", "delegated"})
+        for values in report["summary"].values():
+            self.assertNotIn("judge_calls", values)
+            self.assertNotIn("judge_failures", values)
+        self.assertEqual(report["summary"]["single"]["provider_calls"], 1)
+        with tempfile.TemporaryDirectory() as directory:
+            evaluation.render_report(report, Path(directory))
+            page = (Path(directory) / "report.html").read_text()
+        self.assertNotIn("Judge", page)
+        self.assertIn("bugfix-pages", page)
+
+
 class GatewayTests(unittest.TestCase):
     def test_streaming_receipt_must_match_provider_model_connection_and_client(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -511,6 +543,24 @@ class GatewayTests(unittest.TestCase):
             error.exception.close()
             with self.assertRaises(ValueError):
                 proxy.dispatch({"model": "another-model", "messages": []})
+            self.assertEqual(proxy.global_budget.calls, 0)
+        finally:
+            proxy.close()
+
+    def test_removed_systemone_endpoint_is_not_served(self):
+        proxy = Proxy(CASES[0], "delegated", Budget(10, 100_000, 30))
+        try:
+            request = urllib.request.Request(
+                proxy.base_url + "/systemone",
+                data=json.dumps({"model": proxy.model,
+                                 "questions": {"delivered": "yes/no"}}).encode(),
+                headers={"Authorization": "Bearer " + proxy.key,
+                         "Content-Type": "application/json"})
+            with self.assertRaises(urllib.error.HTTPError) as error:
+                urllib.request.urlopen(request, timeout=2)
+            self.assertEqual(error.exception.code, 404)
+            error.exception.close()
+            self.assertEqual(proxy.requests, [])
             self.assertEqual(proxy.global_budget.calls, 0)
         finally:
             proxy.close()
