@@ -29,9 +29,9 @@ fn large_failure_details_keep_sidebar_status_and_retained_text(cx: &mut TestAppC
         ui.with(cx, |window, cx| {
             window.render_frame(cx);
             let panel = window.find("sidebar").bounds();
-            let subtitle = window.find(("sidebar-subtitle", 0usize)).bounds();
-            assert!(subtitle.size.width > px(20.));
-            assert!(subtitle.left() >= panel.left() && subtitle.right() <= panel.right());
+            let title = window.find(("sidebar-title", 0usize)).bounds();
+            assert!(title.size.width > px(20.));
+            assert!(title.left() >= panel.left() && title.right() <= panel.right());
         });
     }
 }
@@ -72,9 +72,9 @@ fn long_failure_first_line_is_bounded_in_the_sidebar_and_kept_in_the_model(
             ui.with(cx, |window, cx| {
                 window.render_frame(cx);
                 let panel = window.find("sidebar").bounds();
-                let subtitle = window.find(("sidebar-subtitle", 0usize)).bounds();
-                assert!(subtitle.size.width > px(20.));
-                assert!(subtitle.left() >= panel.left() && subtitle.right() <= panel.right());
+                let title = window.find(("sidebar-title", 0usize)).bounds();
+                assert!(title.size.width > px(20.));
+                assert!(title.left() >= panel.left() && title.right() <= panel.right());
             });
         }
     }
@@ -148,9 +148,9 @@ fn large_approval_summary_has_a_bounded_sidebar_without_shortening_request_detai
         ui.with(cx, |window, cx| {
             window.render_frame(cx);
             let panel = window.find("sidebar").bounds();
-            let subtitle = window.find(("sidebar-subtitle", 0usize)).bounds();
-            assert!(subtitle.size.width > px(20.));
-            assert!(subtitle.left() >= panel.left() && subtitle.right() <= panel.right());
+            let title = window.find(("sidebar-title", 0usize)).bounds();
+            assert!(title.size.width > px(20.));
+            assert!(title.left() >= panel.left() && title.right() <= panel.right());
         });
     }
 }
