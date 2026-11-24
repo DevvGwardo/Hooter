@@ -131,6 +131,8 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("secondary-j", ToggleChanges, None),
         KeyBinding::new("secondary-b", ToggleSidebar, None),
         KeyBinding::new("secondary-shift-g", CycleSessionGrouping, None),
+        KeyBinding::new("secondary-[", NavBack, None),
+        KeyBinding::new("secondary-]", NavForward, None),
         KeyBinding::new("secondary-shift-a", ToggleApproval, None),
         KeyBinding::new("secondary-o", OpenWorkspace, None),
         KeyBinding::new("secondary-.", Interrupt, None),
@@ -195,6 +197,9 @@ pub fn init(cx: &mut App) {
             MenuItem::action("Open folder…", app::OpenWorkspace),
         ]),
         Menu::new("View").items([
+            MenuItem::action("Back", app::NavBack),
+            MenuItem::action("Forward", app::NavForward),
+            MenuItem::separator(),
             MenuItem::action("Command palette", app::TogglePalette),
             MenuItem::action("Sessions", app::ToggleSidebar),
             MenuItem::action("Terminal", app::ToggleTerminal),

@@ -608,6 +608,44 @@ fn bucket_folds_the_statuses_into_four() {
 }
 
 #[test]
+fn triage_classifies_every_status_and_settled_wins() {
+    use super::{Status, TriageSection};
+    for (status, section) in [
+        (Status::Idle, TriageSection::Settled),
+        (Status::Starting, TriageSection::Working),
+        (Status::Running, TriageSection::Working),
+        (Status::NeedsApproval, TriageSection::Attention),
+        (Status::NeedsReview, TriageSection::Attention),
+        (Status::Blocked, TriageSection::Attention),
+        (Status::Unread, TriageSection::Attention),
+        (Status::Failed { seen: false }, TriageSection::Attention),
+        (Status::Failed { seen: true }, TriageSection::Settled),
+        (Status::Stopped, TriageSection::Settled),
+        (Status::Done, TriageSection::Settled),
+    ] {
+        assert_eq!(
+            TriageSection::from_status(status),
+            section,
+            "{status:?} should be {section:?}"
+        );
+        assert_eq!(TriageSection::from_key(section.key()), Some(section));
+    }
+
+    let mut session = Session::new(1, PathBuf::from("/w"));
+    assert_eq!(session.triage_section(), TriageSection::Settled);
+    session.view.running = true;
+    assert_eq!(session.triage_section(), TriageSection::Working);
+    session.view.pending_approvals = 1;
+    assert_eq!(session.triage_section(), TriageSection::Attention);
+    session.settled = true;
+    assert_eq!(session.triage_section(), TriageSection::Settled);
+    assert_eq!(
+        TriageSection::ALL.map(TriageSection::label),
+        ["Attention", "Working", "Settled"]
+    );
+}
+
+#[test]
 fn last_message_text_is_the_newest_user_or_assistant_text() {
     let mut session = Session::new(1, PathBuf::from("/w"));
     assert_eq!(session.last_message_text(), None);

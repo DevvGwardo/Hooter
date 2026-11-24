@@ -3092,6 +3092,7 @@ fn sidebar_archive_scrollbar_keeps_restore_and_navigation_reachable(cx: &mut Tes
                 updated_at: ix,
                 agent: flint_agent::AgentKind::Flint,
                 general: false,
+                settled: false,
             },
         )
         .unwrap();
@@ -3326,6 +3327,9 @@ fn sidebar_groups_by_project_status_or_agent_and_counts_hidden_sessions(cx: &mut
     });
     let groups =
         |ui: &Ui, cx: &mut TestAppContext| ui.read(cx, |app, cx| app.session_groups(cx).groups);
+    // Triage is the launch default; this fixture exercises the other orders.
+    ui.app
+        .update(cx, |app, cx| app.set_grouping(SessionGrouping::Project, cx));
     // One workspace: one project group, with every session in it.
     let by_project = groups(&ui, cx);
     assert_eq!(by_project.len(), 1);
@@ -3334,7 +3338,7 @@ fn sidebar_groups_by_project_status_or_agent_and_counts_hidden_sessions(cx: &mut
 
     // Grouping is a menu now, not a cycler (docs/PLAN-SIDEBAR-SIMPLIFY.md P5).
     ui.click(cx, "session-grouping");
-    ui.click(cx, ("grouping-option", 1usize));
+    ui.click(cx, ("grouping-option", 2usize));
     assert_eq!(ui.read(cx, |app, _| app.grouping), SessionGrouping::Status);
     let by_status = groups(&ui, cx);
     let labels: Vec<_> = by_status.iter().map(|g| g.label.as_str()).collect();
@@ -3343,7 +3347,7 @@ fn sidebar_groups_by_project_status_or_agent_and_counts_hidden_sessions(cx: &mut
     assert_eq!(by_status[0].rows, vec![3]);
 
     ui.click(cx, "session-grouping");
-    ui.click(cx, ("grouping-option", 2usize));
+    ui.click(cx, ("grouping-option", 3usize));
     assert_eq!(ui.read(cx, |app, _| app.grouping), SessionGrouping::Agent);
     let by_agent = groups(&ui, cx);
     let mut sizes: Vec<_> = by_agent
@@ -3364,8 +3368,13 @@ fn sidebar_groups_by_project_status_or_agent_and_counts_hidden_sessions(cx: &mut
     assert_eq!(filtered.len(), 1);
     assert_eq!((filtered[0].rows.len(), filtered[0].total), (1, 2));
 
-    ui.press(cx, "cmd-shift-g");
-    assert_eq!(ui.read(cx, |app, _| app.grouping), SessionGrouping::Project);
+    // Assert the cycle's next state directly: this host does not deliver
+    // `cmd-...` presses.
+    assert_eq!(SessionGrouping::Agent.next(), SessionGrouping::Triage);
+    ui.app.update(cx, |app, cx| {
+        app.set_grouping(SessionGrouping::Agent.next(), cx)
+    });
+    assert_eq!(ui.read(cx, |app, _| app.grouping), SessionGrouping::Triage);
 }
 
 #[gpui_kit::test]
@@ -3393,6 +3402,7 @@ fn sidebar_groups_every_worktree_of_a_repository_together(cx: &mut TestAppContex
         app.sessions[1].workspace = linked.clone();
         app.sessions[2].workspace = other.clone();
         app.sessions[3].workspace = repo.clone();
+        app.set_grouping(flint_app::app::SessionGrouping::Project, cx);
         cx.notify();
     });
     let groups = ui.read(cx, |app, cx| app.session_groups(cx).groups);
@@ -4729,6 +4739,7 @@ fn combined_changes_survive_restart_continued_edits_and_archive_recovery(cx: &mu
             updated_at: 2,
             agent: flint_agent::AgentKind::Flint,
             general: false,
+            settled: false,
         },
     )
     .unwrap();
@@ -7051,7 +7062,7 @@ fn sidebar_grouping_is_remembered_across_launches(cx: &mut TestAppContext) {
     use flint_app::app::SessionGrouping;
     let options = test_options();
     let ui = open_with(cx, options.clone());
-    assert_eq!(ui.read(cx, |app, _| app.grouping), SessionGrouping::Project);
+    assert_eq!(ui.read(cx, |app, _| app.grouping), SessionGrouping::Triage);
     ui.app
         .update(cx, |app, cx| app.set_grouping(SessionGrouping::Agent, cx));
     let again = open_with(cx, options);

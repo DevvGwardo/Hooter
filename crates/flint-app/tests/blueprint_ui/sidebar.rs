@@ -205,6 +205,7 @@ fn sidebar_project_heading_does_not_depend_on_the_newest_worktree(cx: &mut TestA
         app.sessions[1].workspace = repo.join("src");
         app.sessions[2].workspace = linked.join("src");
         app.sessions[2].touched = std::time::SystemTime::now() + std::time::Duration::from_secs(10);
+        app.set_grouping(flint_app::app::SessionGrouping::Project, cx);
         cx.notify();
     });
     let groups = ui.read(cx, |app, cx| app.session_groups(cx).groups);
@@ -440,6 +441,7 @@ fn sidebar_archived_disclosure_remembers_its_state(cx: &mut TestAppContext) {
                 updated_at: ix,
                 agent: flint_agent::AgentKind::Flint,
                 general: false,
+                settled: false,
             },
         )
         .unwrap();
@@ -457,21 +459,31 @@ fn sidebar_archived_disclosure_remembers_its_state(cx: &mut TestAppContext) {
 }
 
 #[gpui_kit::test]
-fn sidebar_grouping_menu_offers_all_three_orders(cx: &mut TestAppContext) {
+fn sidebar_grouping_menu_offers_all_four_orders(cx: &mut TestAppContext) {
     use flint_app::app::SessionGrouping;
     let ui = open(cx);
+    assert_eq!(
+        ui.read(cx, |app, _| app.grouping),
+        SessionGrouping::Triage,
+        "triage is the default order"
+    );
     assert!(!has(&ui, cx, "grouping-menu"));
     ui.click(cx, "session-grouping");
-    for ix in 0..3usize {
+    for ix in 0..4usize {
         assert!(has_id(&ui, cx, ("grouping-option", ix)), "option {ix}");
     }
-    ui.click(cx, ("grouping-option", 2usize));
+    ui.click(cx, ("grouping-option", 3usize));
     assert_eq!(ui.read(cx, |app, _| app.grouping), SessionGrouping::Agent);
     assert!(!has(&ui, cx, "grouping-menu"), "choosing closes the menu");
     // Escape closes it too, and ⌘⇧G still cycles.
     ui.click(cx, "session-grouping");
     ui.press(cx, "escape");
     assert!(!has(&ui, cx, "grouping-menu"));
-    ui.press(cx, "cmd-shift-g");
-    assert_eq!(ui.read(cx, |app, _| app.grouping), SessionGrouping::Project);
+    // The keyboard cycle is asserted directly: this host does not deliver
+    // `cmd-...` presses (same caveat as settings).
+    assert_eq!(SessionGrouping::Agent.next(), SessionGrouping::Triage);
+    ui.app.update(cx, |app, cx| {
+        app.set_grouping(SessionGrouping::Agent.next(), cx)
+    });
+    assert_eq!(ui.read(cx, |app, _| app.grouping), SessionGrouping::Triage);
 }

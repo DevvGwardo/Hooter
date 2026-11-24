@@ -33,6 +33,9 @@ actions!(
         ToggleChanges,
         ToggleSidebar,
         CycleSessionGrouping,
+        ToggleSettled,
+        NavBack,
+        NavForward,
         ToggleApproval,
         OpenWorkspace,
         OpenWorktrees,
@@ -143,6 +146,8 @@ pub enum SessionFilter {
 /// How the sidebar groups sessions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SessionGrouping {
+    /// By [`crate::session::TriageSection`]: what needs the user first.
+    Triage,
     /// By repository, with every worktree of it together.
     Project,
     /// By [`crate::session::Bucket`].
@@ -153,7 +158,8 @@ pub enum SessionGrouping {
 
 impl SessionGrouping {
     /// Every order, in the order the footer menu lists them.
-    pub const ALL: [SessionGrouping; 3] = [
+    pub const ALL: [SessionGrouping; 4] = [
+        SessionGrouping::Triage,
         SessionGrouping::Project,
         SessionGrouping::Status,
         SessionGrouping::Agent,
@@ -161,14 +167,16 @@ impl SessionGrouping {
 
     pub fn next(self) -> Self {
         match self {
+            Self::Triage => Self::Project,
             Self::Project => Self::Status,
             Self::Status => Self::Agent,
-            Self::Agent => Self::Project,
+            Self::Agent => Self::Triage,
         }
     }
 
     pub fn label(self) -> &'static str {
         match self {
+            Self::Triage => "Triage",
             Self::Project => "Project",
             Self::Status => "Status",
             Self::Agent => "Agent",
@@ -178,18 +186,21 @@ impl SessionGrouping {
     /// The value saved in settings.
     pub fn setting(self) -> &'static str {
         match self {
+            Self::Triage => "triage",
             Self::Project => "project",
             Self::Status => "status",
             Self::Agent => "agent",
         }
     }
 
-    /// From the saved value; anything else groups by project.
+    /// From the saved value; anything else (and old files with no value) is
+    /// triage.
     pub fn from_setting(value: &str) -> Self {
         match value {
+            "project" => Self::Project,
             "status" => Self::Status,
             "agent" => Self::Agent,
-            _ => Self::Project,
+            _ => Self::Triage,
         }
     }
 }
@@ -209,6 +220,10 @@ pub const ARCHIVE_PAGE: usize = 10;
 pub struct FlintApp {
     pub sessions: Vec<Session>,
     pub active: usize,
+    /// Session uids visited before the active one, oldest first (`cmd-[`).
+    pub nav_back: Vec<u64>,
+    /// Session uids visited after going back, for `cmd-]`.
+    pub nav_forward: Vec<u64>,
     /// Workspace new sessions start in.
     pub workspace: PathBuf,
     /// Where settings and saved sessions live.
@@ -444,6 +459,8 @@ impl FlintApp {
             key_path,
             key_sources,
             active: 0,
+            nav_back: Vec::new(),
+            nav_forward: Vec::new(),
             model: settings.model.clone(),
             effort: settings.reasoning_effort(),
             effort_supported: true,
@@ -658,6 +675,85 @@ impl FlintApp {
         self.sessions.iter().position(|s| s.uid == uid)
     }
 
+    /// Makes `ix` active and records the jump for history. Returns whether the
+    /// active session actually changed.
+    fn set_active_session(&mut self, ix: usize) -> bool {
+        if ix >= self.sessions.len() || ix == self.active {
+            return false;
+        }
+        let previous = self.session().uid;
+        self.nav_back.push(previous);
+        self.nav_forward.clear();
+        self.active = ix;
+        true
+    }
+
+    /// User-driven selection: records the previous session for `cmd-[`.
+    /// History navigation calls [`Self::set_active_session`] directly so it
+    /// never records itself.
+    pub fn open_session(&mut self, ix: usize, cx: &mut Context<Self>) {
+        if self.set_active_session(ix) {
+            cx.notify();
+        }
+    }
+
+    pub fn nav_back(&mut self, cx: &mut Context<Self>) {
+        self.navigate_history(true, cx);
+    }
+
+    pub fn nav_forward(&mut self, cx: &mut Context<Self>) {
+        self.navigate_history(false, cx);
+    }
+
+    fn navigate_history(&mut self, backwards: bool, cx: &mut Context<Self>) {
+        loop {
+            let uid = if backwards {
+                self.nav_back.pop()
+            } else {
+                self.nav_forward.pop()
+            };
+            let Some(uid) = uid else {
+                return;
+            };
+            if uid == self.session().uid {
+                continue;
+            }
+            // A session archived since it was visited is skipped.
+            let Some(ix) = self.session_index(uid) else {
+                continue;
+            };
+            let current = self.session().uid;
+            let opposite = if backwards {
+                &mut self.nav_forward
+            } else {
+                &mut self.nav_back
+            };
+            if opposite.last() != Some(&current) {
+                opposite.push(current);
+            }
+            self.active = ix;
+            cx.notify();
+            return;
+        }
+    }
+
+    /// Puts the session aside in triage (or brings it back) and saves the
+    /// change with the session's other metadata.
+    pub fn toggle_settled(&mut self, ix: usize, cx: &mut Context<Self>) {
+        let Some(session) = self.sessions.get_mut(ix) else {
+            return;
+        };
+        session.settled = !session.settled;
+        match session.save_meta() {
+            Ok(()) => self.store_error = None,
+            Err(err) => {
+                self.store_error = Some(format!("Couldn't save session state: {err}"));
+            }
+        }
+        self.session_menu = None;
+        cx.notify();
+    }
+
     pub fn now(&self) -> Duration {
         self.origin.elapsed()
     }
@@ -741,7 +837,7 @@ impl FlintApp {
             let new = self.sessions[ix].uid;
             self.follow_session_selection(old, new, window, cx);
             self.discard_rename();
-            self.active = ix;
+            self.open_session(ix, cx);
             self.sessions[ix].selected_subagent = None;
             self.copied = None;
             self.copied_conversation = None;
@@ -800,12 +896,13 @@ impl FlintApp {
                 && s.workspace == self.workspace
         });
         match reusable {
-            Some(ix) => self.active = ix,
+            Some(ix) => self.open_session(ix, cx),
             None => {
                 let mut session = self.new_session_value(self.workspace.clone());
                 session.agent = agent;
                 self.sessions.push(session);
-                self.active = self.sessions.len() - 1;
+                let ix = self.sessions.len() - 1;
+                self.open_session(ix, cx);
             }
         }
         self.follow_session_selection(old, self.session().uid, window, cx);
@@ -838,7 +935,8 @@ impl FlintApp {
         let mut session = self.new_session_value(workspace);
         session.agent = agent;
         self.sessions.push(session);
-        self.active = self.sessions.len() - 1;
+        let ix = self.sessions.len() - 1;
+        self.open_session(ix, cx);
         self.follow_session_selection(old, self.session().uid, window, cx);
         self.selected_change = None;
         self.composer
@@ -914,3 +1012,7 @@ impl FlintApp {
         cx.notify();
     }
 }
+
+#[cfg(test)]
+#[path = "app_tests.rs"]
+mod tests;

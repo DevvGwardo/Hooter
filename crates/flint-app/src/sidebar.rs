@@ -279,6 +279,15 @@ pub fn render(app: &FlintApp, window: &mut Window, cx: &mut Context<FlintApp>) -
     let mut list: Vec<AnyElement> = Vec::new();
     for (g, group) in groups.into_iter().enumerate() {
         let icon = match group.key {
+            GroupKey::Triage(crate::session::TriageSection::Attention) => {
+                ui::icon(IconName::ShieldAlert, 13., p.warning)
+            }
+            GroupKey::Triage(crate::session::TriageSection::Working) => {
+                ui::icon(IconName::Loader, 13., p.accent)
+            }
+            GroupKey::Triage(crate::session::TriageSection::Settled) => {
+                ui::icon(IconName::Check, 13., p.text_subtle)
+            }
             GroupKey::Project(..) => ui::icon(IconName::Folder, 13., p.text_subtle),
             GroupKey::Status(Bucket::NeedsYou) => ui::icon(IconName::ShieldAlert, 13., p.warning),
             GroupKey::Status(Bucket::Working) => ui::icon(IconName::Loader, 13., p.accent),
@@ -1317,6 +1326,20 @@ fn session_row(app: &FlintApp, ix: usize, cx: &mut Context<FlintApp>) -> AnyElem
                     .border_color(p.border_strong)
                     .bg(p.surface)
                     .shadow_lg()
+                    .child(
+                        item(
+                            "settle-session",
+                            IconName::Check,
+                            if session.settled {
+                                "Unsettle"
+                            } else {
+                                "Settle"
+                            },
+                            p.text,
+                        )
+                        .on_click(cx.listener(move |this, _, _, cx| this.toggle_settled(ix, cx)))
+                        .test_support(),
+                    )
                     .child(
                         item("rename-session", IconName::Pencil, "Rename", p.text)
                             .on_click(cx.listener(move |this, _, window, cx| {
