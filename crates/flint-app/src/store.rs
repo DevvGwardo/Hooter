@@ -30,6 +30,9 @@ pub struct Meta {
     /// Older saved sessions remain attached to their original project.
     #[serde(default)]
     pub general: bool,
+    /// The user put this session aside in triage (old meta files default off).
+    #[serde(default)]
+    pub settled: bool,
 }
 
 /// One line of `events.jsonl`.

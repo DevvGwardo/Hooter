@@ -169,7 +169,8 @@ pub struct Settings {
     pub terminal_open: bool,
     /// The terminal dock's height in pixels.
     pub terminal_height: f32,
-    /// How the sidebar groups sessions: `project`, `status` or `agent`.
+    /// How the sidebar groups sessions: `triage`, `project`, `status` or
+    /// `agent`.
     pub session_grouping: String,
     /// Sidebar headings the user collapsed, as `GroupKey::setting_key` values.
     pub collapsed_groups: Vec<String>,
@@ -233,7 +234,7 @@ impl Default for Settings {
             tip_dismissed: false,
             terminal_open: false,
             terminal_height: crate::term_panel::DEFAULT_HEIGHT,
-            session_grouping: "project".to_string(),
+            session_grouping: "triage".to_string(),
             collapsed_groups: Vec::new(),
             archived_open: false,
             sandbox: true,

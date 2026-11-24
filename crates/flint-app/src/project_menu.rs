@@ -152,8 +152,8 @@ impl FlintApp {
             let mut session = self.new_session_value(path);
             session.agent = agent;
             self.sessions.push(session);
-            self.active = self.sessions.len() - 1;
-            let ix = self.active;
+            let ix = self.sessions.len() - 1;
+            self.open_session(ix, cx);
             self.start_agent_early(ix, cx);
         }
         if previous != self.session().uid {

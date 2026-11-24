@@ -108,6 +108,7 @@ impl FlintApp {
         session.dir = Some(dir);
         session.agent = meta.agent;
         session.general = meta.general;
+        session.settled = meta.settled;
         session.created = from_secs(meta.created_at);
         let mut clock = Duration::ZERO;
         for record in records {
@@ -481,7 +482,7 @@ impl FlintApp {
         self.discard_rename();
         self.sessions.insert(ix, session);
         self.refresh_archives();
-        self.active = ix;
+        self.open_session(ix, cx);
         self.follow_session_selection(previous, self.session().uid, window, cx);
         self.save_session_layout();
         self.store_error = None;

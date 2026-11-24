@@ -32,6 +32,7 @@ fn replay_saved_records(dir: &Path) -> Vec<Logged> {
             updated_at: 0,
             agent: AgentKind::Flint,
             general: false,
+            settled: false,
         },
     )
     .unwrap();

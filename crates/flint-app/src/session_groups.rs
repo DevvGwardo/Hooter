@@ -11,10 +11,13 @@ use crate::app::FlintApp;
 use crate::app::SessionGrouping;
 use crate::project;
 use crate::session::Bucket;
+use crate::session::TriageSection;
 
 /// What a heading stands for.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum GroupKey {
+    /// What needs the user first (the sidebar's default order).
+    Triage(TriageSection),
     /// A repository (every worktree of it) and the folder within it.
     Project(PathBuf, PathBuf),
     Status(Bucket),
@@ -26,6 +29,7 @@ impl GroupKey {
     /// `Settings.collapsed_groups`.
     pub fn setting_key(&self) -> String {
         match self {
+            GroupKey::Triage(section) => format!("triage:{}", section.key()),
             GroupKey::Project(root, subdir) => format!(
                 "project:{}|{}",
                 root.to_string_lossy(),
@@ -40,6 +44,7 @@ impl GroupKey {
     pub fn from_setting_key(key: &str) -> Option<Self> {
         let (kind, rest) = key.split_once(':')?;
         match kind {
+            "triage" => TriageSection::from_key(rest).map(GroupKey::Triage),
             "project" => {
                 let (root, subdir) = rest.split_once('|')?;
                 Some(GroupKey::Project(
@@ -77,6 +82,10 @@ impl FlintApp {
     fn group_of(&self, ix: usize) -> (GroupKey, String, Option<String>) {
         let session = &self.sessions[ix];
         match self.grouping {
+            SessionGrouping::Triage => {
+                let section = session.triage_section();
+                (GroupKey::Triage(section), section.label().to_string(), None)
+            }
             SessionGrouping::Project => {
                 if session.general {
                     return (
@@ -155,6 +164,11 @@ impl FlintApp {
         if self.grouping == SessionGrouping::Status {
             groups.sort_by_key(|group| match group.key {
                 GroupKey::Status(bucket) => bucket as usize,
+                _ => 0,
+            });
+        } else if self.grouping == SessionGrouping::Triage {
+            groups.sort_by_key(|group| match group.key {
+                GroupKey::Triage(section) => section as usize,
                 _ => 0,
             });
         }

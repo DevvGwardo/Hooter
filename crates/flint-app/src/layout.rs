@@ -259,6 +259,9 @@ impl Render for FlintApp {
             .capture_action(cx.listener(task_action_guard::<ToggleChanges>))
             .capture_action(cx.listener(task_action_guard::<ToggleSidebar>))
             .capture_action(cx.listener(task_action_guard::<CycleSessionGrouping>))
+            .capture_action(cx.listener(task_action_guard::<ToggleSettled>))
+            .capture_action(cx.listener(task_action_guard::<NavBack>))
+            .capture_action(cx.listener(task_action_guard::<NavForward>))
             .capture_action(cx.listener(task_action_guard::<ToggleApproval>))
             .capture_action(cx.listener(task_action_guard::<OpenWorkspace>))
             .capture_action(cx.listener(task_action_guard::<OpenWorktrees>))
@@ -319,6 +322,12 @@ impl Render for FlintApp {
             .on_action(cx.listener(|this, _: &CycleSessionGrouping, _, cx| {
                 this.set_grouping(this.grouping.next(), cx);
             }))
+            .on_action(cx.listener(|this, _: &ToggleSettled, _, cx| {
+                let ix = this.active;
+                this.toggle_settled(ix, cx);
+            }))
+            .on_action(cx.listener(|this, _: &NavBack, _, cx| this.nav_back(cx)))
+            .on_action(cx.listener(|this, _: &NavForward, _, cx| this.nav_forward(cx)))
             // Shift+Tab: the agent's own modes when it has them, else auto-run.
             .on_action(cx.listener(|this, _: &ToggleApproval, _, cx| {
                 if !this.cycle_agent_mode(cx) {

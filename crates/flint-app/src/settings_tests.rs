@@ -518,3 +518,15 @@ fn load_reports_a_discarded_settings_file_and_used_otherwise() {
         "the plain loader keeps its old contract"
     );
 }
+
+#[test]
+fn session_grouping_defaults_to_triage_and_loads_saved_orders() {
+    assert_eq!(Settings::default().session_grouping, "triage");
+    for value in ["triage", "project", "status", "agent"] {
+        let saved: Settings = toml::from_str(&format!("session_grouping = \"{value}\"")).unwrap();
+        assert_eq!(saved.session_grouping, value);
+    }
+    // A file written before the field existed still loads.
+    let old: Settings = toml::from_str("model = \"existing-model\"").unwrap();
+    assert_eq!(old.session_grouping, "triage");
+}

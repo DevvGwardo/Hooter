@@ -56,6 +56,9 @@ pub struct Session {
     pub touched: SystemTime,
     /// A turn finished while the session was not on screen.
     pub unread: bool,
+    /// The user put this session aside; triage keeps it under "Settled"
+    /// whatever its live status.
+    pub settled: bool,
     /// Engine ops channel, once the session has started an engine.
     pub ops: Option<async_channel::Sender<Op>>,
     /// Events pump (engine) or demo playback; dropping it stops either.
@@ -211,6 +214,67 @@ impl Status {
     }
 }
 
+/// The sidebar's triage bucket for a session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum TriageSection {
+    /// Needs the user before anything else moves.
+    Attention,
+    /// A turn (or agent startup) is in progress.
+    Working,
+    /// Finished, stopped, idle, or explicitly put aside.
+    Settled,
+}
+
+impl TriageSection {
+    pub const ALL: [TriageSection; 3] = [
+        TriageSection::Attention,
+        TriageSection::Working,
+        TriageSection::Settled,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            TriageSection::Attention => "Attention",
+            TriageSection::Working => "Working",
+            TriageSection::Settled => "Settled",
+        }
+    }
+
+    /// The stable name this section is saved under (group keys).
+    pub fn key(self) -> &'static str {
+        match self {
+            TriageSection::Attention => "attention",
+            TriageSection::Working => "working",
+            TriageSection::Settled => "settled",
+        }
+    }
+
+    /// From [`Self::key`]; anything else is `None`.
+    pub fn from_key(key: &str) -> Option<Self> {
+        match key {
+            "attention" => Some(TriageSection::Attention),
+            "working" => Some(TriageSection::Working),
+            "settled" => Some(TriageSection::Settled),
+            _ => None,
+        }
+    }
+
+    /// Where a live status falls before the explicit settle override.
+    pub fn from_status(status: Status) -> Self {
+        match status {
+            Status::Running | Status::Starting => TriageSection::Working,
+            Status::NeedsApproval
+            | Status::NeedsReview
+            | Status::Blocked
+            | Status::Unread
+            | Status::Failed { seen: false } => TriageSection::Attention,
+            Status::Done | Status::Stopped | Status::Idle | Status::Failed { seen: true } => {
+                TriageSection::Settled
+            }
+        }
+    }
+}
+
 /// `45s`, `3m 05s`, `1h 12m`: a running turn's elapsed time.
 pub fn clock(elapsed: Duration) -> String {
     let secs = elapsed.as_secs();
@@ -245,6 +309,7 @@ impl Session {
             created: SystemTime::now(),
             touched: SystemTime::now(),
             unread: false,
+            settled: false,
             ops: None,
             pump: None,
             submitted_at: None,
@@ -382,6 +447,16 @@ impl Session {
             Status::Idle
         } else {
             Status::Done
+        }
+    }
+
+    /// Where triage puts the session. Settling wins over the live status, so
+    /// an approval on a session the user put aside stays out of Attention.
+    pub fn triage_section(&self) -> TriageSection {
+        if self.settled {
+            TriageSection::Settled
+        } else {
+            TriageSection::from_status(self.status())
         }
     }
 
@@ -640,6 +715,7 @@ impl Session {
                 updated_at: unix_secs(self.touched),
                 agent: self.agent,
                 general: self.general,
+                settled: self.settled,
             },
         )
     }

@@ -1,5 +1,6 @@
-//! The floating sidebar: new agent, search, sessions grouped by workspace with
-//! live status glyphs, and filter/settings at the bottom.
+//! The floating sidebar: the Hooter wordmark with back/forward history,
+//! search and quick actions, triage sections with rich and compact session
+//! rows, and a compact utility footer.
 
 use std::time::SystemTime;
 
@@ -14,25 +15,28 @@ use gpui_kit::*;
 
 use crate::app::ARCHIVE_PAGE;
 use crate::app::FlintApp;
+use crate::app::NavBack;
+use crate::app::NavForward;
 use crate::app::NewSession;
 use crate::app::OpenWorkspace;
 use crate::app::SESSION_PAGE;
 use crate::app::SessionFilter;
 use crate::app::SessionGrouping;
 use crate::app::SidebarMenu;
+use crate::app::ToggleChanges;
 use crate::app::ToggleSidebar;
 use crate::app::ToggleTerminal;
 use crate::project;
 use crate::session::Bucket;
 use crate::session::Status;
-use crate::session::Tone;
+use crate::session::TriageSection;
 use crate::session_groups::GroupKey;
 use crate::session_groups::SessionGroups;
 use crate::theme::palette;
 use crate::theme::size;
 use crate::ui;
 
-/// Minimum content width for full filter names and footer controls.
+/// Minimum content width for the search row and footer controls.
 pub const MIN_WIDTH: f32 = 264.;
 
 fn white(alpha: f32) -> Hsla {
@@ -115,18 +119,30 @@ pub fn render(app: &FlintApp, window: &mut Window, cx: &mut Context<FlintApp>) -
         .clone();
 
     // The dedicated grip moves the panel; the rest of the row moves the window.
-    // One title, one indicator, the close button: the mark and the product name
-    // belong to the titlebar and the welcome screen, not to this panel.
-    let waiting = app
-        .sessions
-        .iter()
-        .filter(|session| session.status().bucket() == Bucket::NeedsYou)
-        .count();
-    let working = app
-        .sessions
-        .iter()
-        .filter(|session| session.status().bucket() == Bucket::Working)
-        .count();
+    // The mark and the history buttons stay together on the left, the close
+    // button on the right.
+    let nav_back = history_button(
+        "nav-back",
+        IconName::ArrowLeft,
+        "Back",
+        "⌘[",
+        !app.nav_back.is_empty(),
+    )
+    .on_click(cx.listener(|_, _, window, cx| {
+        window.dispatch_action(Box::new(NavBack), cx);
+    }))
+    .test_support();
+    let nav_forward = history_button(
+        "nav-forward",
+        IconName::ArrowRight,
+        "Forward",
+        "⌘]",
+        !app.nav_forward.is_empty(),
+    )
+    .on_click(cx.listener(|_, _, window, cx| {
+        window.dispatch_action(Box::new(NavForward), cx);
+    }))
+    .test_support();
     let top = app.drag_region(
         div()
             .id("sidebar-top")
@@ -138,44 +154,20 @@ pub fn render(app: &FlintApp, window: &mut Window, cx: &mut Context<FlintApp>) -
             .px(px(12.))
             .child(crate::docking::handle(crate::docking::Panel::Sidebar, cx))
             .child(
-                ui::label("Sessions", size::SM, p.text_muted)
+                ui::label("Hooter", size::SM, p.text)
                     .id("sidebar-heading")
                     .font_weight(FontWeight::MEDIUM)
                     .test_support(),
             )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(2.))
+                    .child(nav_back)
+                    .child(nav_forward),
+            )
             .child(div().flex_1())
-            .when(waiting > 0, |header| {
-                header.child(
-                    div()
-                        .id("sidebar-waiting")
-                        .flex_shrink_0()
-                        .flex()
-                        .items_center()
-                        .gap(px(3.))
-                        .tooltip(move |window, cx| {
-                            Tooltip::new(format!("{waiting} need you")).build(window, cx)
-                        })
-                        .child(ui::icon(IconName::CircleAlert, 11., p.warning))
-                        .child(ui::label(waiting.to_string(), size::XS, p.warning))
-                        .test_support(),
-                )
-            })
-            .when(working > 0, |header| {
-                header.child(
-                    div()
-                        .id("sidebar-working")
-                        .flex_shrink_0()
-                        .flex()
-                        .items_center()
-                        .gap(px(3.))
-                        .tooltip(move |window, cx| {
-                            Tooltip::new(format!("{working} working")).build(window, cx)
-                        })
-                        .child(ui::spinner(app.now(), 11., p.accent))
-                        .child(ui::label(working.to_string(), size::XS, p.accent))
-                        .test_support(),
-                )
-            })
             .child(
                 div()
                     .id("hide-sidebar")
@@ -203,82 +195,54 @@ pub fn render(app: &FlintApp, window: &mut Window, cx: &mut Context<FlintApp>) -
         cx,
     );
 
-    // The one primary action keeps the panel's only accent surface; opening a
-    // folder and the terminal are occasional and stay icon-only.
-    let new_agent = div()
-        .id("new-agent")
-        .role(gpui_kit::Role::Button)
-        .aria_label("New agent")
-        .tab_index(0)
-        .focus_visible(|style| style.border_1().border_color(p.accent))
-        .flex_1()
-        .min_w_0()
-        .h(px(36.))
-        .px(px(12.))
-        .rounded(px(9.))
-        .flex()
-        .items_center()
-        .gap(px(11.))
-        .cursor_pointer()
-        .bg(p.accent_soft)
-        .border_1()
-        .border_color(p.accent.opacity(0.18))
-        .hover(|style| style.bg(p.accent.opacity(0.18)))
+    // Search shares one row with the two occasional icon actions; the big
+    // accent bar and the terminal moved out (the footer carries the terminal).
+    let new_agent = icon_button("new-agent", IconName::SquarePen, "New agent", "⌘N")
         .on_click(cx.listener(|_, _, window, cx| {
             window.dispatch_action(Box::new(NewSession), cx);
         }))
-        .child(ui::icon(IconName::SquarePen, 16., p.accent))
-        .child(div().flex_1().min_w_0().truncate().child(ui::label(
-            "New agent",
-            size::BASE,
-            p.text,
-        )))
-        .child(ui::label(
-            crate::shortcuts::label("⌘N"),
-            size::XS,
-            p.text_subtle,
-        ))
         .test_support();
-
     let open_folder = icon_button("open-folder", IconName::FolderPlus, "Open folder", "⌘O")
         .on_click(cx.listener(|_, _, window, cx| {
             window.dispatch_action(Box::new(OpenWorkspace), cx);
         }))
         .test_support();
-
-    let terminal = icon_button("terminal", IconName::SquareTerminal, "Terminal", "⌃`")
-        .when(app.terminal.open, |button| button.bg(white(0.075)))
-        .on_click(cx.listener(|_, _, window, cx| {
-            window.dispatch_action(Box::new(ToggleTerminal), cx);
-        }))
-        .test_support();
-
-    let primary_actions = div()
+    let search = div()
+        .id("session-search-row")
         .flex_shrink_0()
+        .mx(px(10.))
+        .mb(px(8.))
+        .h(px(34.))
         .flex()
         .items_center()
         .gap(px(6.))
-        .mx(px(8.))
-        .mb(px(8.))
-        .h(px(36.))
-        .child(new_agent)
+        .child(
+            div().flex_1().min_w_0().child(
+                Input::new(&app.search)
+                    .id("session-search")
+                    .prefix(ui::icon(IconName::Search, 14., p.text_subtle))
+                    .cleanable(true)
+                    .small(),
+            ),
+        )
         .child(open_folder)
-        .child(terminal);
-
-    let search = div().flex_shrink_0().mx(px(10.)).mb(px(8.)).child(
-        Input::new(&app.search)
-            .id("session-search")
-            .prefix(ui::icon(IconName::Search, 14., p.text_subtle))
-            .cleanable(true)
-            .small(),
-    );
+        .child(new_agent)
+        .test_support();
 
     // Headings per the chosen grouping. A heading counts "n of N" when
     // search, the filter or paging hides some of its sessions.
     let SessionGroups { groups, more } = app.session_groups(cx);
     let mut list: Vec<AnyElement> = Vec::new();
     for (g, group) in groups.into_iter().enumerate() {
+        let triage = matches!(group.key, GroupKey::Triage(_));
         let icon = match group.key {
+            GroupKey::Triage(TriageSection::Attention) => {
+                ui::icon(IconName::ShieldAlert, 13., p.warning)
+            }
+            GroupKey::Triage(TriageSection::Working) => ui::spinner(app.now(), 13., p.accent),
+            GroupKey::Triage(TriageSection::Settled) => {
+                ui::icon(IconName::Check, 13., p.text_subtle)
+            }
             GroupKey::Project(..) => ui::icon(IconName::Folder, 13., p.text_subtle),
             GroupKey::Status(Bucket::NeedsYou) => ui::icon(IconName::ShieldAlert, 13., p.warning),
             GroupKey::Status(Bucket::Working) => ui::icon(IconName::Loader, 13., p.accent),
@@ -290,8 +254,9 @@ pub fn render(app: &FlintApp, window: &mut Window, cx: &mut Context<FlintApp>) -
         let total = group.total;
         let tooltip = group.tooltip.clone();
         // Project and agent headings say how many of theirs are working or
-        // waiting, so a busy group stands out even when scrolled past.
-        let (working, waiting) = if matches!(group.key, GroupKey::Status(_)) {
+        // waiting, so a busy group stands out even when scrolled past. Triage
+        // headings already are the work, so a plain count is enough.
+        let (working, waiting) = if triage || matches!(group.key, GroupKey::Status(_)) {
             (0, 0)
         } else {
             group.rows.iter().fold((0, 0), |(w, n), &ix| {
@@ -408,13 +373,23 @@ pub fn render(app: &FlintApp, window: &mut Window, cx: &mut Context<FlintApp>) -
                                     .test_support(),
                             )
                         })
-                        .when(shown < total, |header| {
-                            header.child(div().flex_shrink_0().child(ui::label(
-                                format!("{shown} of {total}"),
-                                size::XS,
-                                p.text_subtle,
-                            )))
-                        })
+                        // The count keeps its right-aligned slot, so a changing
+                        // number can never move the heading or its rows.
+                        .child(
+                            div()
+                                .id(("group-count", g))
+                                .flex_shrink_0()
+                                .child(ui::label(
+                                    if shown < total {
+                                        format!("{shown} of {total}")
+                                    } else {
+                                        shown.to_string()
+                                    },
+                                    size::XS,
+                                    p.text_subtle,
+                                ))
+                                .test_support(),
+                        )
                         .test_support(),
                 )
                 .children(if collapsed { Vec::new() } else { rows })
@@ -449,45 +424,6 @@ pub fn render(app: &FlintApp, window: &mut Window, cx: &mut Context<FlintApp>) -
         }
     };
 
-    // Equal-width chips in one row and fixed count slots keep live updates from
-    // moving filter targets or changing the list's available height.
-    let counts = app.bucket_counts(cx);
-    let chips: Vec<_> = [
-        SessionFilter::All,
-        SessionFilter::Only(Bucket::NeedsYou),
-        SessionFilter::Only(Bucket::Working),
-        SessionFilter::Only(Bucket::Ready),
-    ]
-    .into_iter()
-    .enumerate()
-    .map(|(ix, filter)| {
-        let (label, icon, tint) = match filter {
-            SessionFilter::All => ("All", None, p.text_subtle),
-            SessionFilter::Only(Bucket::NeedsYou) => {
-                ("Needs you", Some(IconName::ShieldAlert), p.warning)
-            }
-            SessionFilter::Only(Bucket::Working) => ("Working", Some(IconName::Loader), p.accent),
-            SessionFilter::Only(Bucket::Ready) => ("Ready", Some(IconName::Check), p.text_subtle),
-            SessionFilter::Only(_) => ("Sessions", None, p.text_subtle),
-        };
-        let count_color = match filter {
-            SessionFilter::Only(Bucket::NeedsYou) if counts.of(filter) > 0 => p.warning,
-            SessionFilter::Only(Bucket::Working) if counts.of(filter) > 0 => p.accent,
-            _ => p.text_subtle,
-        };
-        filter_chip(
-            ix,
-            label,
-            icon,
-            tint,
-            counts.of(filter),
-            filter == app.filter,
-            count_color,
-        )
-        .on_click(cx.listener(move |this, _, _, cx| this.set_filter(filter, cx)))
-        .test_support()
-    })
-    .collect();
     let grouping = app.grouping;
     let group_toggle = div()
         .id("session-grouping")
@@ -504,14 +440,12 @@ pub fn render(app: &FlintApp, window: &mut Window, cx: &mut Context<FlintApp>) -
             ))
             .build(window, cx)
         })
-        .w(px(98.))
+        .size(px(28.))
         .flex_shrink_0()
-        .h(px(24.))
-        .px(px(8.))
-        .rounded(px(6.))
+        .rounded(px(7.))
         .flex()
         .items_center()
-        .gap(px(5.))
+        .justify_center()
         .cursor_pointer()
         .when(app.sidebar_menu == Some(SidebarMenu::Grouping), |button| {
             button.bg(p.raised)
@@ -522,23 +456,8 @@ pub fn render(app: &FlintApp, window: &mut Window, cx: &mut Context<FlintApp>) -
                 (this.sidebar_menu != Some(SidebarMenu::Grouping)).then_some(SidebarMenu::Grouping);
             cx.notify();
         }))
-        .child(ui::icon(IconName::Layers, 13., p.text_subtle))
-        .child(div().min_w_0().truncate().child(ui::label(
-            grouping.label(),
-            size::XS,
-            p.text_subtle,
-        )))
-        .child(ui::icon(IconName::ChevronDown, 11., p.text_subtle))
+        .child(ui::icon(IconName::ArrowUpDown, 16., p.text_subtle))
         .test_support();
-    let filters = div()
-        .id("session-filters")
-        .flex_shrink_0()
-        .mx(px(10.))
-        .mb(px(8.))
-        .h(px(28.))
-        .flex()
-        .gap(px(4.))
-        .children(chips);
     // The grouping picker opens above the footer row: the footer is the last
     // child of a fixed-height panel, so a panel below it would be clipped.
     let grouping_menu = (app.sidebar_menu == Some(SidebarMenu::Grouping)).then(|| {
@@ -605,32 +524,150 @@ pub fn render(app: &FlintApp, window: &mut Window, cx: &mut Context<FlintApp>) -
             )))
             .test_support()
     });
-    let bottom = div()
+
+    // The footer is one compact icon bar: utilities on the left, list order
+    // and the archive drawer on the right.
+    let settings = icon_button("settings", IconName::Settings, "Settings", "⌘,")
+        .on_click(cx.listener(|this, _, window, cx| this.open_settings(window, cx)))
+        .test_support();
+    let changes = icon_button("sidebar-changes", IconName::FileDiff, "Changes", "⌘J")
+        .when(app.changes_open, |button| button.bg(white(0.075)))
+        .on_click(cx.listener(|_, _, window, cx| {
+            window.dispatch_action(Box::new(ToggleChanges), cx);
+        }))
+        .test_support();
+    let terminal = icon_button("terminal", IconName::SquareTerminal, "Terminal", "⌃`")
+        .when(app.terminal.open, |button| button.bg(white(0.075)))
+        .on_click(cx.listener(|_, _, window, cx| {
+            window.dispatch_action(Box::new(ToggleTerminal), cx);
+        }))
+        .test_support();
+    let archived_toggle = div()
+        .id("archived-sessions")
+        .role(gpui_kit::Role::Button)
+        .aria_label(format!("Archived, {} sessions", app.archives.len()))
+        .tab_index(0)
+        .focus_visible(|style| style.border_1().border_color(p.accent))
+        .size(px(28.))
         .flex_shrink_0()
-        .py(px(8.))
+        .relative()
+        .rounded(px(7.))
+        .flex()
+        .items_center()
+        .justify_center()
+        .cursor_pointer()
+        .when(app.archived_open, |button| button.bg(white(0.075)))
+        .hover(|style| style.bg(white(0.06)))
+        .tooltip(|window, cx| Tooltip::new("Archived sessions").build(window, cx))
+        .on_click(cx.listener(|this, _, _, cx| this.toggle_archived(cx)))
+        .child(ui::icon(IconName::Archive, 16., p.text_muted))
+        .child(div().absolute().top(px(2.)).right(px(2.)).child(ui::label(
+            if app.archives.len() > 99 {
+                "99+".to_string()
+            } else {
+                app.archives.len().to_string()
+            },
+            9.,
+            p.text_subtle,
+        )))
+        .test_support();
+    let footer = div()
+        .id("sidebar-footer")
+        .flex_shrink_0()
+        .h(px(38.))
         .border_t_1()
         .border_color(white(0.05))
+        .px(px(8.))
+        .flex()
+        .items_center()
+        .gap(px(2.))
+        .child(settings)
+        .child(changes)
+        .child(terminal)
+        .child(div().flex_1())
+        .child(group_toggle)
+        .when(!app.archives.is_empty(), |bar| bar.child(archived_toggle))
+        .test_support();
+    let bottom = div()
+        .flex_shrink_0()
         .when_some(grouping_menu, |bottom, menu| bottom.child(menu))
-        .child(
-            div()
-                .flex()
-                .items_center()
-                .pr(px(8.))
-                .child(
-                    nav_row(
-                        "settings",
-                        IconName::Settings,
-                        "Settings",
-                        Some(&crate::shortcuts::label("⌘,")),
-                    )
-                    .h(px(28.))
-                    .flex_1()
-                    .min_w_0()
-                    .on_click(cx.listener(|this, _, window, cx| this.open_settings(window, cx)))
+        .child(footer);
+
+    // The archive drawer keeps its own scroll area, opened from the footer.
+    let archived = (!app.archives.is_empty() && app.archived_open).then(|| {
+        div()
+            .relative()
+            .flex_shrink_0()
+            .border_t_1()
+            .border_color(white(0.05))
+            .child(
+                div()
+                    .id("archive-list")
+                    // The compact drawer loses the titlebar's height;
+                    // keep that space available to current sessions.
+                    .max_h(px(if app.session_drawer && !app.sidebar_visible {
+                        76.
+                    } else {
+                        112.
+                    }))
+                    .overflow_y_scroll()
+                    .track_scroll(&app.archive_scroll)
+                    .pr(px(12.))
+                    .children(app.archives.iter().enumerate().take(app.archive_limit).map(
+                        |(ix, (_, meta))| {
+                            let title = meta.title.as_deref().unwrap_or("session").to_string();
+                            let tip = format!("Restore {title}\n{}", meta.workspace.display());
+                            let row = div()
+                                .id(("restore-archive", ix))
+                                .role(gpui_kit::Role::Button)
+                                .aria_label(format!("Restore {title}"))
+                                .tab_index(0)
+                                .focus_visible(|style| style.border_2().border_color(p.accent))
+                                .mx(px(8.))
+                                .px(px(12.))
+                                .h(px(34.))
+                                .rounded(px(7.))
+                                .flex()
+                                .items_center()
+                                .gap(px(8.))
+                                .cursor_pointer()
+                                .hover(|style| style.bg(white(0.05)))
+                                .tooltip(move |window, cx| {
+                                    Tooltip::new(tip.clone()).build(window, cx)
+                                })
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    this.restore_archive(ix, window, cx)
+                                }))
+                                .child(ui::icon(IconName::ArchiveRestore, 14., p.text_muted))
+                                .child(div().flex_1().min_w_0().truncate().child(ui::label(
+                                    title,
+                                    size::SM,
+                                    p.text,
+                                )))
+                                .test_support();
+                            ScrollableRow {
+                                id: ("archive-scroll-row", ix).into(),
+                                row: div().id(("archive-container", ix)).child(row),
+                                scroll: app.archive_scroll.clone(),
+                            }
+                        },
+                    ))
+                    .when(app.archives.len() > app.archive_limit, |list| {
+                        let hidden = app.archives.len() - app.archive_limit;
+                        list.child(show_more(
+                            "show-more-archives",
+                            hidden.min(ARCHIVE_PAGE),
+                            hidden,
+                            cx.listener(|this, _, _, cx| {
+                                this.archive_limit += ARCHIVE_PAGE;
+                                cx.notify();
+                            }),
+                        ))
+                    })
                     .test_support(),
-                )
-                .child(group_toggle),
-        );
+            )
+            .child(Scrollbar::vertical(&app.archive_scroll).mode(ScrollbarMode::Always))
+    });
 
     div()
         .id("sidebar")
@@ -648,9 +685,7 @@ pub fn render(app: &FlintApp, window: &mut Window, cx: &mut Context<FlintApp>) -
         .border_color(p.border)
         .overflow_hidden()
         .child(top)
-        .child(primary_actions)
         .child(search)
-        .child(filters)
         .child(
             div()
                 .relative()
@@ -699,140 +734,7 @@ pub fn render(app: &FlintApp, window: &mut Window, cx: &mut Context<FlintApp>) -
                 )
                 .child(Scrollbar::vertical(&app.sidebar_scroll).mode(ScrollbarMode::Always)),
         )
-        .when(!app.archives.is_empty(), |sidebar| {
-            sidebar
-                .child(
-                    div()
-                        .id("archived-sessions")
-                        .role(gpui_kit::Role::Button)
-                        .aria_label(format!("Archived, {} sessions", app.archives.len()))
-                        .tab_index(0)
-                        .focus_visible(|style| style.border_1().border_color(p.accent))
-                        .flex_shrink_0()
-                        .border_t_1()
-                        .border_color(white(0.05))
-                        .h(px(30.))
-                        .px(px(20.))
-                        .flex()
-                        .items_center()
-                        .gap(px(6.))
-                        .cursor_pointer()
-                        .hover(|style| style.bg(white(0.04)))
-                        .on_click(cx.listener(|this, _, _, cx| this.toggle_archived(cx)))
-                        .child(ui::icon(
-                            if app.archived_open {
-                                IconName::ChevronDown
-                            } else {
-                                IconName::ChevronRight
-                            },
-                            11.,
-                            p.text_subtle,
-                        ))
-                        .child(ui::label(
-                            format!("Archived · {}", app.archives.len()),
-                            size::SM,
-                            p.text_muted,
-                        ))
-                        .test_support(),
-                )
-                .when(app.archived_open, |sidebar| {
-                    sidebar.child(
-                        div()
-                            .relative()
-                            .child(
-                                div()
-                                    .id("archive-list")
-                                    // The compact drawer loses the titlebar's height;
-                                    // keep that space available to current sessions.
-                                    .max_h(px(if app.session_drawer && !app.sidebar_visible {
-                                        76.
-                                    } else {
-                                        112.
-                                    }))
-                                    .overflow_y_scroll()
-                                    .track_scroll(&app.archive_scroll)
-                                    .pr(px(12.))
-                                    .children(
-                                        app.archives
-                                            .iter()
-                                            .enumerate()
-                                            .take(app.archive_limit)
-                                            .map(|(ix, (_, meta))| {
-                                                let title = meta
-                                                    .title
-                                                    .as_deref()
-                                                    .unwrap_or("session")
-                                                    .to_string();
-                                                let tip = format!(
-                                                    "Restore {title}\n{}",
-                                                    meta.workspace.display()
-                                                );
-                                                let row = div()
-                                                    .id(("restore-archive", ix))
-                                                    .role(gpui_kit::Role::Button)
-                                                    .aria_label(format!("Restore {title}"))
-                                                    .tab_index(0)
-                                                    .focus_visible(|style| {
-                                                        style.border_2().border_color(p.accent)
-                                                    })
-                                                    .mx(px(8.))
-                                                    .px(px(12.))
-                                                    .h(px(34.))
-                                                    .rounded(px(7.))
-                                                    .flex()
-                                                    .items_center()
-                                                    .gap(px(8.))
-                                                    .cursor_pointer()
-                                                    .hover(|style| style.bg(white(0.05)))
-                                                    .tooltip(move |window, cx| {
-                                                        Tooltip::new(tip.clone()).build(window, cx)
-                                                    })
-                                                    .on_click(cx.listener(
-                                                        move |this, _, window, cx| {
-                                                            this.restore_archive(ix, window, cx)
-                                                        },
-                                                    ))
-                                                    .child(ui::icon(
-                                                        IconName::ArchiveRestore,
-                                                        14.,
-                                                        p.text_muted,
-                                                    ))
-                                                    .child(
-                                                        div().flex_1().min_w_0().truncate().child(
-                                                            ui::label(title, size::SM, p.text),
-                                                        ),
-                                                    )
-                                                    .test_support();
-                                                ScrollableRow {
-                                                    id: ("archive-scroll-row", ix).into(),
-                                                    row: div()
-                                                        .id(("archive-container", ix))
-                                                        .child(row),
-                                                    scroll: app.archive_scroll.clone(),
-                                                }
-                                            }),
-                                    )
-                                    .when(app.archives.len() > app.archive_limit, |list| {
-                                        let hidden = app.archives.len() - app.archive_limit;
-                                        list.child(show_more(
-                                            "show-more-archives",
-                                            hidden.min(ARCHIVE_PAGE),
-                                            hidden,
-                                            cx.listener(|this, _, _, cx| {
-                                                this.archive_limit += ARCHIVE_PAGE;
-                                                cx.notify();
-                                            }),
-                                        ))
-                                    })
-                                    .test_support(),
-                            )
-                            .child(
-                                Scrollbar::vertical(&app.archive_scroll)
-                                    .mode(ScrollbarMode::Always),
-                            ),
-                    )
-                })
-        })
+        .children(archived)
         .child(bottom)
         .test_support()
 }
@@ -875,66 +777,22 @@ fn show_more(
         .test_support()
 }
 
-/// One choice in the filter strip, with how many sessions it would show. Four
-/// of these share one row, so each is an icon (or the word "All") plus its
-/// count; the full name lives in the accessible label and the tooltip.
-fn filter_chip(
-    ix: usize,
-    label: &'static str,
-    icon: Option<IconName>,
-    tint: Hsla,
-    count: usize,
-    selected: bool,
-    count_color: Hsla,
-) -> Stateful<Div> {
-    let p = palette();
-    let empty = count == 0 && !selected;
-    let label_color = if selected { p.text } else { p.text_subtle };
-    let has_icon = icon.is_some();
-    div()
-        .id(("session-filter", ix))
-        .role(gpui_kit::Role::Button)
-        .aria_label(format!("{label}, {count}"))
-        // Empty chips stay clickable but out of the tab order.
-        .tab_index(if empty { -1 } else { 0 })
-        .focus_visible(|style| style.border_1().border_color(p.accent))
-        .tooltip(move |window, cx| Tooltip::new(format!("{label} ({count})")).build(window, cx))
-        .flex_1()
-        .min_w_0()
-        .h(px(28.))
-        .px(px(6.))
-        .rounded(px(6.))
-        .flex()
-        .items_center()
-        .justify_center()
-        .gap(px(4.))
-        .cursor_pointer()
-        .bg(if selected { p.raised } else { white(0.) })
-        .hover(|style| style.bg(white(0.06)))
-        .when_some(icon, |chip, icon| {
-            chip.child(ui::icon(icon, 12., tint).flex_shrink_0())
-        })
-        .when(!has_icon, |chip| {
-            chip.child(ui::label(label, size::XS, label_color))
-        })
-        // The count keeps its slot at zero so live updates cannot move targets.
-        .child(ui::label(
-            if count > 999 {
-                "999+".to_string()
-            } else {
-                count.to_string()
-            },
-            size::XS,
-            count_color,
-        ))
-}
-
 /// A 28 px icon-only button for the sidebar's secondary actions.
 fn icon_button(
     id: &'static str,
     icon: IconName,
     label: &'static str,
     hint: &'static str,
+) -> Stateful<Div> {
+    icon_button_tinted(id, icon, label, hint, palette().text_muted)
+}
+
+fn icon_button_tinted(
+    id: &'static str,
+    icon: IconName,
+    label: &'static str,
+    hint: &'static str,
+    color: Hsla,
 ) -> Stateful<Div> {
     let p = palette();
     div()
@@ -952,110 +810,44 @@ fn icon_button(
         .cursor_pointer()
         .hover(|style| style.bg(white(0.06)))
         .tooltip(move |window, cx| Tooltip::new(format!("{label}  {hint}")).build(window, cx))
-        .child(ui::icon(icon, 16., p.text_muted))
+        .child(ui::icon(icon, 16., color))
 }
 
-fn nav_row(
+/// A history button: as large as the other icon actions, but visibly dimmed
+/// once there is nowhere to go. It stays clickable; the handler is a no-op.
+fn history_button(
     id: &'static str,
     icon: IconName,
     label: &'static str,
-    hint: Option<&str>,
+    hint: &'static str,
+    enabled: bool,
 ) -> Stateful<Div> {
     let p = palette();
-    div()
-        .id(id)
-        .role(gpui_kit::Role::Button)
-        .aria_label(label)
-        .tab_index(0)
-        .focus_visible(|style| style.border_2().border_color(p.accent))
-        .mx(px(8.))
-        .px(px(12.))
-        .h(px(38.))
-        .flex_shrink_0()
-        .rounded(px(9.))
-        .flex()
-        .items_center()
-        .gap(px(11.))
-        .cursor_pointer()
-        .hover(|style| style.bg(white(0.05)))
-        .child(ui::icon(icon, 16., p.text_muted))
-        .child(
-            div()
-                .flex_1()
-                .min_w_0()
-                .truncate()
-                .child(ui::label(label, size::BASE, p.text)),
-        )
-        .when_some(hint.map(str::to_string), |row, hint| {
-            row.child(ui::label(hint, size::XS, p.text_subtle))
-        })
+    let color = if enabled {
+        p.text_muted
+    } else {
+        p.text_subtle.opacity(0.35)
+    };
+    icon_button_tinted(id, icon, label, hint, color)
 }
 
 fn session_row(app: &FlintApp, ix: usize, cx: &mut Context<FlintApp>) -> AnyElement {
     let p = palette();
     let session = &app.sessions[ix];
     let active = ix == app.active && session.selected_subagent.is_none();
-    let status = session.status();
     let now = app.now();
-    let glyph: AnyElement = match status {
-        Status::Running => ui::spinner(now, 13., p.accent).into_any_element(),
-        Status::Starting => ui::spinner(now, 13., p.text_subtle).into_any_element(),
-        Status::NeedsApproval => ui::icon(IconName::ShieldAlert, 13., p.warning).into_any_element(),
-        Status::NeedsReview => ui::icon(IconName::CircleAlert, 13., p.warning).into_any_element(),
-        Status::Blocked => ui::icon(IconName::CircleStop, 13., p.warning).into_any_element(),
-        Status::Failed { seen } => ui::icon(
-            IconName::CircleX,
-            13.,
-            if seen { p.text_subtle } else { p.danger },
-        )
-        .into_any_element(),
-        Status::Stopped => ui::icon(IconName::CircleStop, 12., p.text_subtle).into_any_element(),
-        Status::Unread => div()
-            .size(px(7.))
-            .rounded_full()
-            .bg(p.accent)
-            .into_any_element(),
-        Status::Done => ui::icon(IconName::Check, 12., p.text_subtle).into_any_element(),
-        Status::Idle => div()
-            .size(px(7.))
-            .rounded_full()
-            .border_1()
-            .border_color(p.text_subtle)
-            .into_any_element(),
-    };
-    let (subtitle, tone) = session.status_line(now);
-    let subtitle_color = match tone {
-        Tone::Muted => p.text_subtle,
-        Tone::Warning => p.warning,
-        Tone::Danger if matches!(status, Status::Failed { seen: true }) => p.text_subtle,
-        Tone::Danger => p.danger,
-    };
-    // ACP sessions carry their agent's name, e.g. "Claude Code · Answered".
-    let subtitle = match session.agent {
-        flint_agent::AgentKind::Flint => subtitle,
-        agent => format!("{} · {subtitle}", agent.label()),
-    };
-    // Under another grouping the heading no longer says which project it is.
-    let subtitle = if app.grouping == SessionGrouping::Project {
-        subtitle
-    } else {
-        format!(
-            "{} · {subtitle}",
-            project::identity(&session.workspace).label()
-        )
-    };
-    let emphasized = active
-        || matches!(
-            status,
-            Status::Unread
-                | Status::NeedsApproval
-                | Status::NeedsReview
-                | Status::Blocked
-                | Status::Failed { seen: false }
-        );
-    // A running session shows how long its turn has taken; others, when
-    // they were last active.
-    let (when, when_color) = match session.running_for(now) {
+    let status = session.status();
+    let compact = session.triage_section() == TriageSection::Settled;
+    let general = session.general;
+    let project_label = project::identity(&session.workspace).label();
+    let branch = project::branch(&session.workspace);
+    let agent_label = session.agent.label().to_string();
+    let tokens = session.total_tokens();
+    let full_title = session.title();
+    // A running session shows how long its turn has taken; others, when they
+    // were last active.
+    let elapsed = session.running_for(now);
+    let (when, when_color) = match elapsed {
         Some(elapsed) => (crate::session::clock(elapsed), p.accent),
         None => (
             ui::ago(
@@ -1066,20 +858,30 @@ fn session_row(app: &FlintApp, ix: usize, cx: &mut Context<FlintApp>) -> AnyElem
             p.text_subtle,
         ),
     };
+    let (status_line, _) = session.status_line(now);
+    let emphasized = active
+        || matches!(
+            status,
+            Status::Unread
+                | Status::NeedsApproval
+                | Status::NeedsReview
+                | Status::Blocked
+                | Status::Failed { seen: false }
+        );
     let renaming = app
         .renaming
         .as_ref()
         .filter(|(row, _)| *row == ix)
         .map(|(_, input)| input.clone());
     let is_renaming = renaming.is_some();
-    let full_title = session.title();
-    let full_subtitle = subtitle.clone();
-    // The branch keeps its own segment on the second line. The token total is a
-    // diagnostic rather than a navigation aid, so it moves into the tooltip.
-    let branch = project::branch(&session.workspace);
-    let tokens = session.total_tokens();
+    // The branch and token diagnostics live on the third line and the tooltip;
+    // the title stays one clean line.
     let title_tooltip = {
         let mut tip = full_title.clone();
+        if !status_line.is_empty() {
+            tip.push('\n');
+            tip.push_str(&status_line);
+        }
         if let Some(branch) = &branch {
             tip.push('\n');
             tip.push_str(branch);
@@ -1089,6 +891,7 @@ fn session_row(app: &FlintApp, ix: usize, cx: &mut Context<FlintApp>) -> AnyElem
         }
         tip
     };
+    let title_size = if compact { size::XS } else { size::BASE };
     let title: AnyElement = match renaming {
         Some(input) => {
             let focus = input.focus_handle(cx);
@@ -1113,172 +916,300 @@ fn session_row(app: &FlintApp, ix: usize, cx: &mut Context<FlintApp>) -> AnyElem
             .flex_1()
             .min_w_0()
             .truncate()
-            .text_size(px(size::BASE))
+            .text_size(px(title_size))
             .text_color(if emphasized { p.text } else { p.text_muted })
-            .when(
-                matches!(status, Status::Unread | Status::Failed { seen: false }),
-                |t| t.font_weight(FontWeight::MEDIUM),
-            )
+            .when(!compact || emphasized, |t| {
+                t.font_weight(FontWeight::MEDIUM)
+            })
             .tooltip(move |window, cx| Tooltip::new(title_tooltip.clone()).build(window, cx))
-            .child(session.title())
+            .child(full_title.clone())
             .test_support()
             .into_any_element(),
     };
-    // Two lines: title, then branch · status · time. The row's own hover group
-    // is what reveals the actions glyph, so bounds never move.
     let row_group = format!("session-row-{ix}");
-    let row = div()
-        .id(("session", ix))
-        .group(row_group.clone())
+    let settle_hint = if session.settled {
+        "Unsettle"
+    } else {
+        "Settle"
+    };
+    // Bounds are pinned by the fixed-size slots; only the glyphs fade in, so
+    // the title never shifts when the actions appear.
+    let reveal_actions = active || app.session_menu == Some(ix);
+    let actions = div()
+        .id(("session-actions", ix))
         .role(gpui_kit::Role::Button)
-        .aria_label(format!("Session: {}", session.title()))
-        .tab_index(if is_renaming { -1 } else { 0 })
-        .focus_visible(|style| style.border_2().border_color(p.accent))
-        .mx(px(8.))
-        .px(px(12.))
-        .py(px(4.))
-        .rounded(px(11.))
+        .aria_label(format!("Actions for {}", session.title()))
+        .tab_index(0)
+        .focus_visible(|style| style.border_1().border_color(p.accent))
+        .size(px(24.))
+        .flex_shrink_0()
+        .rounded(px(5.))
         .flex()
-        .gap(px(11.))
+        .items_center()
+        .justify_center()
         .cursor_pointer()
-        .when(active, |row| {
-            row.bg(p.accent_soft)
-                .border_1()
-                .border_color(p.accent.opacity(0.16))
-        })
-        .when(!active, |row| row.hover(|style| style.bg(white(0.04))))
-        .on_click(cx.listener(move |this, _, window, cx| {
-            if !is_renaming {
-                this.select_session(ix, window, cx);
-            }
+        .hover(|style| style.bg(white(0.08)))
+        .tooltip(|window, cx| Tooltip::new("Session actions").build(window, cx))
+        .on_click(cx.listener(move |this, _, _, cx| {
+            this.session_menu = if this.session_menu == Some(ix) {
+                None
+            } else {
+                Some(ix)
+            };
+            cx.stop_propagation();
+            cx.notify();
         }))
-        .on_mouse_down(
-            MouseButton::Right,
-            cx.listener(move |this, _, _, cx| {
-                this.session_menu = Some(ix);
-                cx.notify();
-            }),
-        )
         .child(
             div()
-                .w(px(16.))
-                .h(px(22.))
-                .flex_shrink_0()
-                .flex()
-                .items_center()
-                .justify_center()
-                .child(glyph),
-        )
-        .child(
-            div()
-                .flex_1()
-                .min_w_0()
-                .flex()
-                .flex_col()
-                .gap(px(2.))
-                .child(
-                    div()
-                        .min_w_0()
-                        .flex()
-                        .items_center()
-                        .gap(px(8.))
-                        .child(title),
-                )
-                .child(
-                    div()
-                        .min_w_0()
-                        .flex()
-                        .items_center()
-                        .gap(px(8.))
-                        .when_some(branch, |line, branch| {
-                            let tip = branch.clone();
-                            line.child(
-                                div()
-                                    .id(("sidebar-branch", ix))
-                                    .flex_shrink_1()
-                                    .min_w_0()
-                                    .flex()
-                                    .items_center()
-                                    .gap(px(3.))
-                                    .text_size(px(size::XS))
-                                    .text_color(p.text_subtle)
-                                    .tooltip(move |window, cx| {
-                                        Tooltip::new(tip.clone()).build(window, cx)
-                                    })
-                                    .child(ui::icon(IconName::GitBranch, 11., p.text_subtle))
-                                    .child(div().min_w_0().truncate().child(branch))
-                                    .test_support(),
-                            )
-                        })
-                        .child(
-                            div()
-                                .id(("sidebar-subtitle", ix))
-                                .flex_1()
-                                .min_w_0()
-                                .truncate()
-                                .text_size(px(size::XS))
-                                .text_color(subtitle_color)
-                                .tooltip(move |window, cx| {
-                                    Tooltip::new(full_subtitle.clone()).build(window, cx)
-                                })
-                                .child(subtitle)
-                                .test_support(),
-                        )
-                        .child(
-                            div()
-                                .id(("sidebar-when", ix))
-                                .flex_shrink_0()
-                                .child(ui::label(when, size::XS, when_color))
-                                .test_support(),
-                        ),
-                ),
-        )
-        .child(
-            div()
-                .id(("session-actions", ix))
-                .role(gpui_kit::Role::Button)
-                .aria_label(format!("Actions for {}", session.title()))
-                .tab_index(0)
-                .focus_visible(|style| style.border_1().border_color(p.accent))
-                .size(px(24.))
-                .flex_shrink_0()
-                .rounded(px(5.))
-                .flex()
-                .items_center()
-                .justify_center()
-                .cursor_pointer()
-                .hover(|style| style.bg(white(0.08)))
-                .tooltip(|window, cx| Tooltip::new("Session actions").build(window, cx))
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    this.session_menu = if this.session_menu == Some(ix) {
-                        None
-                    } else {
-                        Some(ix)
-                    };
-                    cx.stop_propagation();
-                    cx.notify();
-                }))
-                .child(
-                    // The glyph stays hidden until the row is hovered or active,
-                    // while the 24 px slot keeps its bounds. Only the inner
-                    // wrapper fades, so the button stays hit-testable.
-                    div()
-                        .opacity(if active || app.session_menu == Some(ix) {
-                            1.
-                        } else {
-                            0.
-                        })
-                        .group_hover(row_group, |style| style.opacity(1.))
-                        .child(ui::icon(IconName::Ellipsis, 14., p.text_muted)),
-                )
-                .test_support(),
+                .opacity(if reveal_actions { 1. } else { 0. })
+                .group_hover(row_group.clone(), |style| style.opacity(1.))
+                .child(ui::icon(IconName::Ellipsis, 14., p.text_muted)),
         )
         .test_support();
-    let row = if is_renaming {
-        row
+
+    let row = if compact {
+        let row = div()
+            .id(("session", ix))
+            .group(row_group.clone())
+            .role(gpui_kit::Role::Button)
+            .aria_label(format!("Session: {}", session.title()))
+            .tab_index(if is_renaming { -1 } else { 0 })
+            .focus_visible(|style| style.border_2().border_color(p.accent))
+            .mx(px(8.))
+            .px(px(10.))
+            .h(px(if is_renaming { 34. } else { 30. }))
+            .rounded(px(7.))
+            .flex()
+            .items_center()
+            .gap(px(8.))
+            .cursor_pointer()
+            .when(active, |row| {
+                row.bg(p.raised)
+                    .border_1()
+                    .border_color(p.accent.opacity(0.16))
+            })
+            .when(!active, |row| row.hover(|style| style.bg(white(0.04))))
+            .on_click(cx.listener(move |this, _, window, cx| {
+                if !is_renaming {
+                    this.select_session(ix, window, cx);
+                }
+            }))
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(move |this, _, _, cx| {
+                    this.session_menu = Some(ix);
+                    cx.notify();
+                }),
+            )
+            .child(ui::icon(
+                if general {
+                    IconName::Sparkles
+                } else {
+                    IconName::Folder
+                },
+                14.,
+                p.text_subtle,
+            ))
+            .child(title)
+            .child(
+                div()
+                    .id(("sidebar-when", ix))
+                    .flex_shrink_0()
+                    .child(ui::label(when.clone(), size::XS, when_color))
+                    .test_support(),
+            )
+            .child(actions)
+            .test_support();
+        let row = if is_renaming {
+            row
+        } else {
+            crate::session_workspace::drag_row(row, session.uid, session.title(), cx)
+        };
+        row.into_any_element()
     } else {
-        crate::session_workspace::drag_row(row, session.uid, session.title(), cx)
+        // The rich card: project and live status, title, then branch/agent
+        // context with the row actions. Three quiet lines, one warm surface.
+        let status_right: AnyElement = match status {
+            Status::NeedsApproval => {
+                ui::pill("? Input", p.warning, p.warning.opacity(0.14)).into_any_element()
+            }
+            Status::NeedsReview | Status::Blocked => {
+                ui::pill("Review", p.warning, p.warning.opacity(0.14)).into_any_element()
+            }
+            Status::Failed { .. } => {
+                ui::pill("Failed", p.danger, p.danger.opacity(0.14)).into_any_element()
+            }
+            Status::Running | Status::Starting => div()
+                .flex()
+                .items_center()
+                .gap(px(4.))
+                .child(ui::spinner(now, 11., p.accent))
+                .child(ui::label(
+                    if elapsed.is_some() {
+                        format!("Working {when}")
+                    } else {
+                        "Working".to_string()
+                    },
+                    size::XS,
+                    p.accent,
+                ))
+                .into_any_element(),
+            _ => ui::label(when.clone(), size::XS, when_color).into_any_element(),
+        };
+        let context: AnyElement = match &branch {
+            Some(branch) => {
+                let tip = branch.clone();
+                div()
+                    .id(("sidebar-branch", ix))
+                    .flex_shrink_1()
+                    .min_w_0()
+                    .flex()
+                    .items_center()
+                    .gap(px(3.))
+                    .text_size(px(size::XS))
+                    .text_color(p.text_subtle)
+                    .tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx))
+                    .child(ui::icon(IconName::GitBranch, 11., p.text_subtle))
+                    .child(div().min_w_0().truncate().child(branch.clone()))
+                    .test_support()
+                    .into_any_element()
+            }
+            None => div()
+                .id(("sidebar-subtitle", ix))
+                .flex_shrink_1()
+                .min_w_0()
+                .flex()
+                .items_center()
+                .gap(px(3.))
+                .truncate()
+                .text_size(px(size::XS))
+                .text_color(p.text_subtle)
+                .child(ui::icon(IconName::Bot, 11., p.text_subtle))
+                .child(div().min_w_0().truncate().child(agent_label.clone()))
+                .test_support()
+                .into_any_element(),
+        };
+        let quick_settle = div()
+            .id(("quick-settle", ix))
+            .role(gpui_kit::Role::Button)
+            .aria_label(settle_hint)
+            .tab_index(0)
+            .focus_visible(|style| style.border_1().border_color(p.accent))
+            .size(px(24.))
+            .flex_shrink_0()
+            .rounded(px(5.))
+            .flex()
+            .items_center()
+            .justify_center()
+            .cursor_pointer()
+            .hover(|style| style.bg(white(0.08)))
+            .tooltip(move |window, cx| Tooltip::new(settle_hint).build(window, cx))
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.toggle_settled(ix, cx);
+                cx.stop_propagation();
+            }))
+            .child(
+                div()
+                    .opacity(if reveal_actions { 1. } else { 0. })
+                    .group_hover(row_group.clone(), |style| style.opacity(1.))
+                    .child(ui::icon(
+                        if session.settled {
+                            IconName::Check
+                        } else {
+                            IconName::Archive
+                        },
+                        14.,
+                        p.text_muted,
+                    )),
+            )
+            .test_support();
+        let row = div()
+            .id(("session", ix))
+            .group(row_group)
+            .role(gpui_kit::Role::Button)
+            .aria_label(format!("Session: {}", session.title()))
+            .tab_index(if is_renaming { -1 } else { 0 })
+            .focus_visible(|style| style.border_2().border_color(p.accent))
+            .mx(px(8.))
+            .px(px(10.))
+            .py(px(4.))
+            .rounded(px(8.))
+            .flex()
+            .flex_col()
+            .gap(px(1.))
+            .cursor_pointer()
+            .when(active, |row| {
+                row.bg(p.accent_soft)
+                    .border_1()
+                    .border_color(p.accent.opacity(0.16))
+            })
+            .when(!active, |row| row.hover(|style| style.bg(white(0.04))))
+            .on_click(cx.listener(move |this, _, window, cx| {
+                if !is_renaming {
+                    this.select_session(ix, window, cx);
+                }
+            }))
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(move |this, _, _, cx| {
+                    this.session_menu = Some(ix);
+                    cx.notify();
+                }),
+            )
+            .child(
+                div()
+                    .min_w_0()
+                    .flex()
+                    .items_center()
+                    .gap(px(6.))
+                    .child(ui::icon(
+                        if general {
+                            IconName::Sparkles
+                        } else {
+                            IconName::Folder
+                        },
+                        12.,
+                        p.text_subtle,
+                    ))
+                    .child(
+                        div()
+                            .id(("sidebar-project", ix))
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
+                            .text_size(px(size::XS))
+                            .text_color(p.text_muted)
+                            .child(project_label)
+                            .test_support(),
+                    )
+                    .child(
+                        div()
+                            .id(("sidebar-when", ix))
+                            .flex_shrink_0()
+                            .child(status_right)
+                            .test_support(),
+                    ),
+            )
+            .child(title)
+            .child(
+                div()
+                    .min_w_0()
+                    .flex()
+                    .items_center()
+                    .gap(px(4.))
+                    .child(div().flex_1().min_w_0().flex().child(context))
+                    .child(actions)
+                    .child(quick_settle),
+            )
+            .test_support();
+        if is_renaming {
+            row.into_any_element()
+        } else {
+            crate::session_workspace::drag_row(row, session.uid, session.title(), cx)
+                .into_any_element()
+        }
     };
+
     let item = |id: &'static str, icon: IconName, label: &'static str, color: Hsla| {
         div()
             .id((id, ix))
@@ -1317,6 +1248,20 @@ fn session_row(app: &FlintApp, ix: usize, cx: &mut Context<FlintApp>) -> AnyElem
                     .border_color(p.border_strong)
                     .bg(p.surface)
                     .shadow_lg()
+                    .child(
+                        item(
+                            "settle-session",
+                            IconName::Check,
+                            if session.settled {
+                                "Unsettle"
+                            } else {
+                                "Settle"
+                            },
+                            p.text,
+                        )
+                        .on_click(cx.listener(move |this, _, _, cx| this.toggle_settled(ix, cx)))
+                        .test_support(),
+                    )
                     .child(
                         item("rename-session", IconName::Pencil, "Rename", p.text)
                             .on_click(cx.listener(move |this, _, window, cx| {
